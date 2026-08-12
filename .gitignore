@@ -1,0 +1,24 @@
+# STM32CubeIDE 构建产物
+/Debug/
+/Release/
+
+# 编译中间文件
+*.o
+*.d
+*.elf
+*.map
+*.list
+*.hex
+*.bin
+*.axf
+
+# IDE 配置（保留 .cproject/.project 以便导入工程）
+.settings/
+
+# 链接器和启动文件备份
+*.bak
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
