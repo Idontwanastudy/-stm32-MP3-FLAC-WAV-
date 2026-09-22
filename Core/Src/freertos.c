@@ -25,6 +25,8 @@
 #include "Music_Driver.h"
 #include "OLED.h"
 #include "wm8960.h"    /* 音量键 PF7/PF8 → I2C 调 WM8960 音量 */
+#include "font_store.h" /* W25Q64 点阵字库: 上电加载 / 从 SD 卡烧写 */
+#include "fatfs.h"
 #include "timers.h"
 #include "usbd_storage_if.h"
 #include "usbd_core.h"
@@ -160,6 +162,66 @@ void MX_FREERTOS_Init(void) {
   * @param  argument: Not used
   * @retval None
   */
+/* ================= 点阵字库(W25Q64) 上电加载 / 从 SD 卡烧写 =================
+ * 用法: 把 tools/gen_font.py 生成的 font16.bin 放到 SD 卡根目录, 开机自动烧进 W25Q64 并校验;
+ *       之后把文件从 SD 卡删掉也没关系(Flash 里已经有了)。内容相同会跳过, 不会每次开机重复写。
+ * 注意: 下面这些提示文字本身由内 flash 的 8x16 + GB2312 兜底字库显示, 所以字库还没烧入时也能正常提示。 */
+static void font_progress(uint32_t done, uint32_t total)
+{
+  char buf[20];
+  if (total == 0) return;
+  sprintf(buf, "%lu%%", (unsigned long)((done * 100u) / total));
+  OLED_ShowString(3, 1, "烧写字库");
+  OLED_ShowString(3, 10, "     ");
+  OLED_ShowString(3, 10, buf);
+  OLED_RefreshScreenWithScroll();
+}
+
+static void FONT_BOOT(void)
+{
+  int rc;
+
+  OLED_Clear();
+  OLED_ShowString(1, 1, "字库检查中...");
+  OLED_RefreshScreenWithScroll();
+
+  if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
+    rc = font_store_boot_check("0:/font16.bin", font_progress);
+    if (rc == 1) {                        /* 本次烧写成功 */
+      OLED_Clear();
+      OLED_ShowString(1, 1, "字库已更新");
+      OLED_ShowString(2, 1, "字节:");
+      OLED_ShowNum(2, 6, font_store_size(), 7);
+      OLED_RefreshScreenWithScroll();
+      osDelay(1200);
+    } else if (rc < 0) {                  /* 烧写出错 */
+      OLED_Clear();
+      OLED_ShowString(1, 1, "字库写入失败");
+      OLED_ShowString(2, 1, "错误码:");
+      OLED_ShowNum(2, 8, (uint32_t)(-rc), 2);
+      OLED_ShowString(3, 1, "检查SD卡上的");
+      OLED_ShowString(4, 1, "font16.bin");
+      OLED_RefreshScreenWithScroll();
+      osDelay(2000);
+    }
+  }
+
+  OLED_Clear();
+  if (font_store_ready()) {
+    OLED_ShowString(1, 1, "字库就绪");
+    OLED_ShowString(2, 1, "区段:");
+    OLED_ShowNum(2, 6, font_store_ranges(), 2);
+    OLED_ShowString(3, 1, "多语言已启用");
+  } else {
+    OLED_ShowString(1, 1, "字库未烧入");
+    OLED_ShowString(2, 1, "把 font16.bin");
+    OLED_ShowString(3, 1, "放SD卡根目录");
+    OLED_ShowString(4, 1, "再开机");
+  }
+  OLED_RefreshScreenWithScroll();
+  osDelay(1200);
+}
+
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
@@ -170,6 +232,8 @@ void StartDefaultTask(void *argument)
   if (scroll_timerHandle != NULL) {
     osTimerStart(scroll_timerHandle, 50);
   }
+  /* ★点阵字库: 从 W25Q64 加载; SD 根目录有 font16.bin 且内容不同则自动烧入并校验 */
+  FONT_BOOT();
   uint8_t usb_was_connected = 0;
   /* Infinite loop */
   for(;;)

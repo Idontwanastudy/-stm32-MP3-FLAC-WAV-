@@ -9,6 +9,13 @@
  */
 #include "OLED_GB2312.h"
 
+/* 字库来源开关:
+ *   内 flash 的 GB2312 表(约 230KB) 现在只作"兜底"——W25Q64 字库里没有的字(或字库没烧)时用它。
+ *   等你实测 W25Q64 字库一切正常后, 把下面改成 0 就能把这 230KB 从内 flash 里省掉。 */
+#define OLED_USE_INTERNAL_GB2312   1
+
+#include "font_store.h"     /* W25Q64 字库(西里尔/假名/谚文/汉字/全角) */
+
 /* F407: I2C1 句柄定义在 main.c, 这里 extern 引用 (F103 是从 i2c.h 引入) */
 extern I2C_HandleTypeDef hi2c1;
 
@@ -326,32 +333,105 @@ void OLED_ShowChar(uint8_t Line, uint8_t Column, char Char)
 	}
 }
 
+/* ================= UTF-8 取字引擎 =================
+ * 三级取字顺序:
+ *   1) ASCII(0x20~0x7E) → 内 flash 里专门的 8x16 点阵字体 OLED_F8x16
+ *      (它按 8 像素宽设计, 显示英文比把 TTF 塞进 8px 更好看; 也永远可用, 是最终兜底)
+ *   2) 其它字符 → 查 W25Q64 字库(西里尔/假名/谚文/汉字/全角, 见 tools/gen_font.py)
+ *   3) 都没有 → 退回内 flash 的 GB2312 表(可被 OLED_USE_INTERNAL_GB2312 关掉), 再没有就画 '?'
+ * 字形排布: 上页 cols*8 字节 + 下页 cols*8 字节, bit0 = 页顶(与 SSD1306 一致)
+ */
+static uint32_t OLED_Utf8Next(const char *s, uint8_t *adv)
+{
+	const uint8_t *p = (const uint8_t *)s;
+	if (p[0] < 0x80)           { *adv = 1; return p[0]; }
+	if ((p[0] & 0xE0) == 0xC0) {                       /* 2 字节: 西里尔等 */
+		if (p[1] == 0) { *adv = 1; return 0xFFFD; }
+		*adv = 2;
+		return ((uint32_t)(p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+	}
+	if ((p[0] & 0xF0) == 0xE0) {                       /* 3 字节: 汉字/假名/谚文 */
+		if (p[1] == 0 || p[2] == 0) { *adv = 1; return 0xFFFD; }
+		*adv = 3;
+		return ((uint32_t)(p[0] & 0x0F) << 12) |
+		       ((uint32_t)(p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+	}
+	if ((p[0] & 0xF8) == 0xF0) { *adv = 4; return 0x10000; }   /* 4 字节(emoji/扩展区): 跳过不画 */
+	*adv = 1;
+	return 0xFFFD;
+}
+
+/* 取字形数据。*cols 回传该字形占几个字符列(1=8 像素宽, 2=16 像素宽); 返回 NULL = 三级都没有 */
+static const uint8_t *OLED_GetGlyphData(uint32_t cp, uint8_t *cols)
+{
+	uint8_t bpg = 0;
+
+	if (cp >= 0x20 && cp <= 0x7E) {          /* 1) ASCII: 内 flash 8x16 */
+		*cols = 1;
+		return OLED_F8x16[cp - ' '];
+	}
+	if (font_store_ready()) {                 /* 2) W25Q64 字库 */
+		const uint8_t *g = font_store_glyph(cp, &bpg);
+		if (g != NULL) {
+			*cols = (bpg == 16) ? 1 : 2;
+			return g;
+		}
+	}
+#if OLED_USE_INTERNAL_GB2312
+	if (cp <= 0xFFFF) {                       /* 3) 内 flash GB2312 兜底 */
+		uint16_t idx = OLED_GB2312_GetIndex((uint16_t)cp);
+		if (idx != 0xFFFF) {
+			*cols = 2;
+			return OLED_GB2312_FontData[idx];
+		}
+	}
+#endif
+	return NULL;
+}
+
+/* 在硬件上画一个码点(Line 1~4, Column 1~16), 返回它占了几个字符列 */
+static uint8_t OLED_DrawCodepoint(uint8_t Line, uint8_t Column, uint32_t cp)
+{
+	const uint8_t *g;
+	uint8_t cols = 0, i, width;
+
+	g = OLED_GetGlyphData(cp, &cols);
+	if (g == NULL) {                          /* 缺字: 画两个 '?' 占位 */
+		OLED_ShowChar(Line, (Column - 1) * 2 + 1, '?');
+		OLED_ShowChar(Line, (Column - 1) * 2 + 2, '?');
+		return 2;
+	}
+	width = cols * 8;
+	OLED_SetCursor((Line - 1) * 2, (Column - 1) * 8);          /* 上半页 */
+	for (i = 0; i < width; i++) {
+		OLED_WriteData(g[i]);
+	}
+	OLED_SetCursor((Line - 1) * 2 + 1, (Column - 1) * 8);      /* 下半页 */
+	for (i = width; i < width * 2; i++) {
+		OLED_WriteData(g[i]);
+	}
+	return cols;
+}
+
 /**
-  * @brief  OLED显示字符串（支持中英文混排）
+  * @brief  OLED显示字符串（支持中英俄日韩混排）
   * @param  Line 起始行位置，范围：1~4
   * @param  Column 起始列位置，范围：1~16
-  * @param  String 要显示的字符串，ASCII或UTF-8中文
+  * @param  String UTF-8 字符串(ASCII 1 列; 西里尔/汉字/假名/谚文 2 列)
   * @retval 无
-  * @note   自动识别UTF-8: 首字节>=0xE0时按3字节汉字处理
+  * @note   取字来源见 OLED_GetGlyphData(): 内 flash 8x16 → W25Q64 字库 → 内 flash GB2312
   */
 void OLED_ShowString(uint8_t Line, uint8_t Column, char *String)
 {
-	uint8_t i = 0;
-	while (String[i] != '\0')
+	const char *p = String;
+
+	while (*p != 0 && Column <= 16)
 	{
-		uint8_t ch = (uint8_t)String[i];
-		if (ch >= 0xE0)   /* UTF-8中文字符(3字节), 占2个ASCII列宽 */
-		{
-			OLED_ShowChinese(Line, Column, &String[i]);
-			i += 3;
-			Column += 2;
-		}
-		else              /* ASCII字符, 占1列 */
-		{
-			OLED_ShowChar(Line, Column, (char)ch);
-			i++;
-			Column++;
-		}
+		uint8_t adv = 1;
+		uint32_t cp = OLED_Utf8Next(p, &adv);
+		p += adv;
+		if (cp == 0x10000) continue;                 /* 4 字节字符跳过 */
+		Column += OLED_DrawCodepoint(Line, Column, cp);
 	}
 }
 
@@ -643,48 +723,31 @@ void OLED_ClearBuffer(void) {
 void OLED_DrawStringToBuffer(char *String) {
 	scrollOffset = 0;
 	uint16_t col = 0;
-	uint8_t *p = (uint8_t *)String;
+	const char *p = String;
 
 	/* 清空显示缓冲(页0/页1) */
 	memset(SramBuffer[0], 0, BUFFER_WIDTH);
 	memset(SramBuffer[1], 0, BUFFER_WIDTH);
 
 	while (*p != 0 && col < (BUFFER_WIDTH - 16)) {
-		if (*p < 0x80) {
-			/* ASCII 字符 */
-			if (*p >= 0x20 && *p <= 0x7E) {
-				uint8_t index = *p - ' ';
-				uint8_t j;
-				for (j = 0; j < 8; j++) {
-					SramBuffer[0][col + j] = OLED_F8x16[index][j];      /* 上半 */
-					SramBuffer[1][col + j] = OLED_F8x16[index][j + 8];  /* 下半 */
-				}
+		uint8_t adv = 1, cols = 0;
+		uint32_t cp = OLED_Utf8Next(p, &adv);
+		p += adv;
+		if (cp == 0x10000) continue;               /* 4 字节字符跳过 */
+
+		{
+			const uint8_t *g = OLED_GetGlyphData(cp, &cols);
+			uint8_t width, j;
+			if (g == NULL) {                       /* 缺字: 用两个 '?' 顶位 */
+				g = (const uint8_t *)OLED_F8x16['?' - ' '];
+				cols = 1;
 			}
-			col += 8;
-			p++;
-		}
-		else if (*p >= 0xE0) {
-			/* UTF-8 中文字符(3字节) */
-			uint16_t unicode;
-			uint16_t idx;
-			uint8_t j;
-			if (p[1] == 0 || p[2] == 0) break;
-			unicode = ((uint16_t)(p[0] & 0x0F) << 12) |
-			          ((uint16_t)(p[1] & 0x3F) << 6)  |
-			          ((uint16_t)(p[2] & 0x3F));
-			idx = OLED_GB2312_GetIndex(unicode);
-			if (idx != 0xFFFF) {
-				for (j = 0; j < 16; j++) {
-					SramBuffer[0][col + j] = OLED_GB2312_FontData[idx][j];      /* 上半 */
-					SramBuffer[1][col + j] = OLED_GB2312_FontData[idx][j + 16];  /* 下半 */
-				}
+			width = cols * 8;
+			for (j = 0; j < width; j++) {
+				SramBuffer[0][col + j] = g[j];             /* 上半页 */
+				SramBuffer[1][col + j] = g[width + j];     /* 下半页 */
 			}
-			col += 16;   /* 汉字占2个ASCII列宽 */
-			p += 3;
-		}
-		else {
-			/* 其他字节跳过 */
-			p++;
+			col += width;
 		}
 	}
 	scrollTextWidth = col;   /* 记录文本总宽度(像素) */

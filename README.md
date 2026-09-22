@@ -40,6 +40,7 @@
 | 停止 | ✅ 已实现 | PF5（菜单键，当前暂作停止） |
 | 音量控制 | ✅ 已实现 | PF7 / PF8，WM8960 硬件音量 0~100 档，支持按住连调 |
 | OLED 显示 | ✅ 已实现 | 歌名滚动 / 采样率 / 声道 / 位深 / 播放状态 / 音量 |
+| 多语言文字库 | ✅ 已实现 | 点阵字库存 **W25Q64**，支持 **简中/繁中/日/英/韩/俄**；SD 卡放 `font16.bin` 开机自动烧入 |
 | USB Mass Storage | ✅ 已实现 | 插电脑可当读卡器，此时自动暂停播放并让出 SD 卡 |
 | SD 卡热插拔 | ✅ 已实现 | 拔卡立即提示，插回自动重新挂载并重新扫描 |
 | 外部 DAC 试听口 | ✅ 板上预留 | 另有独立 I2S 排针，可外接 PCM5102a 等做对比试听 |
@@ -138,6 +139,58 @@ graph LR
 
 ---
 
+### 点阵字库（W25Q64 · 简中/繁中/日/英/韩/俄）
+
+字库放在 **W25Q64（8MB SPI Flash）** 里，不占内 flash。关键点是**不要按语言拆成 6 个字库**：
+简、繁、日三种汉字在 Unicode 里**共用同一个区段 U+4E00–U+9FFF**，拆开只会大量重复。
+所以字库是**一个文件、内部按"连续 Unicode 区段"组织**，查字就是一句算术：
+
+```
+偏移 = 区段.data_off + (码点 - 区段.start_cp) × 区段.bpg
+```
+
+**没有索引表、不占 MCU RAM**（区段表只有几项，启动时缓存）。取字是三级回退：
+
+| 顺序 | 来源 | 覆盖 |
+|---|---|---|
+| 1 | 内 flash `OLED_F8x16`（8×16 点阵，1.5KB） | ASCII —— 按 8 像素宽专门设计，比把 TTF 挤进 8px 好看，也永远可用 |
+| 2 | **W25Q64 字库** | 西里尔(俄)、假名(日)、谚文(韩)、CJK 汉字(简/繁/日)、CJK 与全角标点 |
+| 3 | 内 flash GB2312 表（约 230KB，可关） | 兜底；改 `OLED.c` 里 `OLED_USE_INTERNAL_GB2312=0` 即可省掉这 230KB |
+| — | 都没有 | 画 `?` 占位 |
+
+**使用流程（三步）**：
+
+```bash
+# 1) 本机生成字库(需 pip install pillow; 字体建议 思源黑体/Noto Sans CJK, SIL OFL 授权可自由分发)
+python3 tools/gen_font.py --font NotoSansCJKsc-Regular.otf --out font16.bin
+#    不烧板子先看效果:  python3 tools/gen_font.py --font X.otf --preview "音AЖ漢한"
+#    只想先验证链路:    python3 tools/gen_font.py --selftest --out font16.bin   (几何图案自检字库)
+
+# 2) 把 font16.bin 放 SD 卡根目录, 插卡开机 → 自动校验CRC → 擦写 W25Q64 → 回读校验 → 显示"字库已更新"
+#    与 Flash 里内容相同会跳过(不会每次开机重复写); 烧完把文件从 SD 删掉也没关系
+
+# 3) 开机自检显示 "字库就绪 / 区段:n / 多语言已启用", 或 "字库未烧入 / 把 font16.bin 放SD卡根目录"
+```
+
+体积（16×16，六种文字全含 ≈ **1.01 MB**）：
+
+| 区段 | 码点数 | 大小 |
+|---|---|---|
+| 拉丁补充/西文标点（8×16） | 96 | 1.5 KB |
+| 西里尔（俄） | 256 | 8 KB |
+| CJK 标点 | 64 | 2 KB |
+| 平假名/片假名（日） | 192 | 6 KB |
+| 谚文音节（韩） | 11172 | 349 KB |
+| **CJK 汉字（简/繁/日共用）** | 20992 | 656 KB |
+| 全角字符 | 240 | 7.5 KB |
+
+> **性能不是问题**：SPI1 跑 42MHz，读一个字形 32 字节约 6µs，而 OLED 整屏刷新走 I2C 要十几毫秒。
+> 另带 **96 槽字形 LRU 缓存**（约 3KB RAM），滚动字幕反复画同一批字时**完全不碰 SPI**。
+
+代码分工：`font_format.c` 是**纯逻辑**（解析/查表/缓存，不依赖 HAL，可用 gcc 在 PC 上单元测试：
+`gcc -I Core/Inc Core/Src/font_format.c tools/test_font_format.c -o t && ./t font16.bin`）；
+`font_store.c` 负责 W25Q64 读写与 SD 卡烧写；`OLED.c` 的字符串显示与滚动缓冲都接在这套引擎上。
+
 ## 📁 目录结构
 
 ```
@@ -163,6 +216,9 @@ Music_player_F407ZGT6/
 ├── FATFS/                      # FatFs + SD 卡底层驱动(sd_diskio.c / bsp_driver_sd.c)
 ├── Middlewares/                # FreeRTOS / FatFs / libhelix-mp3
 ├── USB_DEVICE/                 # USB Mass Storage 设备
+├── tools/                      # PC 端工具(不参与编译)
+│   ├── gen_font.py             # ★ TTF → 点阵字库 bin(多语言/CRC/自检模式/终端预览)
+│   └── test_font_format.c      # 字库逻辑的宿主机单元测试(gcc 编译运行)
 ├── Hardware/                   # ★ 硬件资料（本板完整设计）
 │   ├── 音乐播放器：STM32F407ZGT6-WM8960-工程开发板.eprj2   # 立创EDA(专业版)工程
 │   ├── hifimp3播放器GERBER/     # GERBER 打包（主板 / 功放板 / 按键板）
