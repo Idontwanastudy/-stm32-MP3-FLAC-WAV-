@@ -101,8 +101,8 @@ int main(int argc, char **argv)
     printf("\n[5] 缺字回退\n");
     {
         uint8_t bpg = 0;
-        CHECK(font_glyph(&font, 0x9FFF, &bpg) == NULL, "字库里没有的码点返回 NULL(上层画 '?')");
-        CHECK(font_glyph(&font, 0x20, &bpg) == NULL, "空格/ASCII 不在字库(走内 flash 的 F8x16)");
+        CHECK(font_glyph(&font, 0x2010, &bpg) == NULL, "字库里没有的码点返回 NULL(上层画 '?')");
+        CHECK(font_glyph(&font, 0x20, &bpg) == NULL, "ASCII 不在字库(走内 flash 的 F8x16; 除非用了 --with-ascii)");
     }
 
     printf("\n[6] LRU 缓存: 连续查 %d 个不同字(远超 %d 个槽)后仍要正确\n",

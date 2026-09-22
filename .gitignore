@@ -29,3 +29,7 @@ mx.scratch
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# 生成的字库(放到 SD 卡根目录用, 不属于源码)
+font16.bin
+tools/*.bin

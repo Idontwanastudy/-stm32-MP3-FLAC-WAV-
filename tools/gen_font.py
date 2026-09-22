@@ -50,37 +50,43 @@ MAGIC = b"MFNT"
 VERSION = 1
 FLAGS = 0x01          # 上页+下页排布, bit0 为页顶
 
-# 区段: (起始码点, 结束码点, 列数, 渲染字号, x偏移, y偏移, 说明)
-#   cols=8  → 8x16, 占 1 个字符列;  cols=16 → 16x16, 占 2 个字符列
-# ★ ASCII(0x20-0x7E) 故意不放进字库: 工程内 flash 里已有专门的 8x16 点阵字体 OLED_F8x16
-#   (1.5KB, 就是按 8 像素宽设计的, 显示英文比 TTF 挤进 8px 更好看), 同时兼作字库缺失时的兜底。
-#   如果确实想要字库版 ASCII(16x16 双宽), 用 --with-ascii。
+# 区段: (起始码点, 结束码点, 列数, 渲染字号, x偏移, 基线行, 说明)
+#   cols=8 → 8x16(占 1 字符列);  cols=16 → 16x16(占 2 字符列)
+#   ★基线行 = 把文字基线放在第几行(0~15)。渲染用 anchor="ls"(左-基线)对齐,
+#     这样所有字共享同一条基线; 若改用"墨迹顶部"对齐, 像 "一" 这种矮字会被顶到最上面。
+#   ★字号/基线不是拍脑袋定的, 是用 tools 里的测量脚本按"整段墨迹必须落在 0~15 行内"实测出来的:
+#     汉字/假名 15px@基线14, 谚文 15px@基线14, 俄文 13px@基线13, 全角 12px@基线13, 西文补充 12px@基线12。
 RANGES_FULL = [
-    (0x00A0, 0x00FF,  8, 12, 0, 3, "Latin-1 补充/西文标点"),
-    (0x0400, 0x04FF, 16, 16, 2, 3, "西里尔(俄文)"),
-    (0x3000, 0x303F, 16, 16, 0, 0, "CJK 标点"),
-    (0x3040, 0x30FF, 16, 16, 0, 0, "平假名/片假名(日文)"),
-    (0xAC00, 0xD7A3, 16, 16, 0, 0, "谚文音节(韩文)"),
-    (0x4E00, 0x9FFF, 16, 16, 0, 0, "CJK 汉字(简/繁/日共用)"),
-    (0xFF00, 0xFFEF, 16, 16, 0, 0, "全角字符"),
+    (0x00A0, 0x00FF,  8, 12,  0, 12, "Latin-1 补充/西文标点"),
+    (0x0400, 0x04FF, 16, 13,  2, 13, "西里尔(俄文)"),
+    # CJK 标点拆三段: 把 U+302A~302D(声调符号) 与 U+3031~3035(竖排假名重复记号) 排除,
+    # 它们比 em 还高近两倍(实测 27 行), 混在同一段里会把整段可用字号被迫压到 10px。
+    (0x3000, 0x3029, 16, 14,  0, 13, "CJK 标点(含《》「」【】)"),
+    (0x302E, 0x3030, 16, 14,  0, 13, "CJK 标点(续)"),
+    (0x3036, 0x303F, 16, 14,  0, 13, "CJK 标点(续)"),
+    (0x3040, 0x30FF, 16, 15,  0, 14, "平假名/片假名(日文)"),
+    (0xAC00, 0xD7A3, 16, 15,  0, 14, "谚文音节(韩文)"),
+    (0x4E00, 0x9FFF, 16, 15,  0, 14, "CJK 汉字(简/繁/日共用)"),
+    (0xFF00, 0xFFEF, 16, 12,  0, 13, "全角字符"),
 ]
-RANGE_ASCII = (0x0020, 0x007E, 16, 16, 0, 0, "ASCII(双宽 16x16)")
+RANGE_ASCII = (0x0020, 0x007E, 16, 15, 0, 14, "ASCII(双宽 16x16)")
 
 PRESETS = {
     "full": RANGES_FULL,
-    "basic": RANGES_FULL[:2],                                  # 只西文补充+俄文(最小, 便于先验证链路)
-    "cjk": [RANGES_FULL[2], RANGES_FULL[5]],                   # 标点 + 汉字
+    "basic": [r for r in RANGES_FULL if r[0] in (0x00A0, 0x0400)],   # 西文补充 + 俄文(最小)
+    "cjk":   [r for r in RANGES_FULL if "CJK" in r[6]],              # CJK 标点 + 汉字
 }
 
 
-def render_glyph(font, cp, cols, x_off=0, y_off=0):
-    """渲染一个码点, 返回 cols*2 字节(上页 cols 字节 + 下页 cols 字节)"""
+def render_glyph(font, cp, cols, x_off=0, baseline=16):
+    """渲染一个码点, 返回 cols*2 字节(上页 cols 字节 + 下页 cols 字节)
+       x_off/baseline: 定位用"左-基线"锚点, baseline 是把基线放在第几行"""
     bpg = cols * 2
     img = Image.new("1", (cols, GLYPH_H), 0)
     if font is not None:
         d = ImageDraw.Draw(img)
         try:
-            d.text((x_off, y_off), chr(cp), font=font, fill=1, anchor="lt")
+            d.text((x_off, baseline), chr(cp), font=font, fill=1, anchor="ls")
         except Exception:
             return None
     buf = bytearray(bpg)
@@ -152,7 +158,7 @@ def build_all(font_file, ranges, selftest):
     total = sum(e - s + 1 for s, e, _, _, _, _, _ in ranges)
     done = 0
     print("  %-26s %-18s %6s %9s" % ("区段", "码点范围", "宽度", "大小"))
-    for start, end, cols, px, xo, yo, name in ranges:
+    for start, end, cols, px, xo, base, name in ranges:
         font = None
         if not selftest:
             if px not in cache:
@@ -161,7 +167,7 @@ def build_all(font_file, ranges, selftest):
         data_off = len(blob)
         bpg = cols * 2
         for cp in range(start, end + 1):
-            g = selftest_glyph(cp, cols) if selftest else render_glyph(font, cp, cols, xo, yo)
+            g = selftest_glyph(cp, cols) if selftest else render_glyph(font, cp, cols, xo, base)
             blob += g if g else bytes(bpg)
             done += 1
             if done % 4000 == 0:
@@ -182,7 +188,7 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="不用字体文件, 生成几何图案自检字库")
     ap.add_argument("--preview", help="渲染这些字符并打印点阵(不烧板子先看效果)")
     ap.add_argument("--px", type=int, help="覆盖所有区段的渲染字号(调这个字会变大变小)")
-    ap.add_argument("--y-off", type=int, help="覆盖所有区段的 y 偏移(整体上下微调)")
+    ap.add_argument("--baseline", type=int, help="覆盖所有区段的基线行(整体上下微调)")
     ap.add_argument("--x-off", type=int, help="覆盖所有区段的 x 偏移(整体左右微调)")
     ap.add_argument("--with-ascii", action="store_true",
                     help="把 ASCII 也放进字库(16x16 双宽); 默认不放, 用内 flash 的 OLED_F8x16")
@@ -197,9 +203,9 @@ def main():
     if args.px is not None:
         for r in ranges:
             r[3] = args.px
-    if args.y_off is not None:
+    if args.baseline is not None:
         for r in ranges:
-            r[5] = args.y_off
+            r[5] = args.baseline
     if args.x_off is not None:
         for r in ranges:
             r[4] = args.x_off
