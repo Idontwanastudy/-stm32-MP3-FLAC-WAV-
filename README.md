@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/version-v1.0-informational" alt="version"/>
 </p>
 
-> 📌 这是 **F407ZGT6 版**（当前 `main` 分支）。旧的 **F103ZET6 版**见分支 **`V1.0-F103Ver`**。
+> 📌 这是 **F407ZGT6 版**（当前 `main` 分支）。旧的 **F103ZET6 版**见分支 **`V0.0-F103Ver`**。
 
 ---
 
