@@ -1111,6 +1111,64 @@ int parse_wav_header(FIL *file, wav_file_parameters *header) {
 }
 
 #if ENABLE_MP3
+/* ================= MP3 帧头校验 =================
+ * ★为什么需要: 只靠"找同步字(0xFFEx)"定位第一帧是不可靠的——
+ *   ID3v2 里的内嵌封面(JPEG 的标记字节就是 FF E0~FF EF, 与 MP3 同步字一模一样!)会被误命中,
+ *   于是解码器把封面数据当音频流, 解出 16kHz/单声道的垃圾(实测: Queen 那首 504KB 封面的歌就是)。
+ *   对策: 候选同步字处必须能解析出**合法帧头**, 并且**按帧长跳到下一帧也是合法帧头且采样率/声道一致**
+ *   —— 伪造的同步字几乎不可能同时满足这两条。 */
+
+/* 解析 4 字节 MP3 帧头。合法返回 1, 并回传采样率/声道/帧长(字节) */
+static int mp3_hdr_info(const uint8_t *p, uint32_t *hz, uint32_t *ch, uint32_t *flen)
+{
+	static const uint16_t br_v1[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};   /* MPEG1 Layer3 kbps */
+	static const uint16_t br_v2[16] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0};        /* MPEG2/2.5 Layer3 */
+	static const uint16_t sr_v1[3]  = {44100,48000,32000};
+	static const uint16_t sr_v2[3]  = {22050,24000,16000};
+	static const uint16_t sr_v25[3] = {11025,12000,8000};
+	uint32_t h;
+	int version, layer, br_idx, sr_idx, pad, chan;
+	uint32_t br, sr;
+
+	if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return 0;
+	h = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+	version = (int)((h >> 19) & 0x3);
+	layer   = (int)((h >> 17) & 0x3);
+	br_idx  = (int)((h >> 12) & 0xF);
+	sr_idx  = (int)((h >> 10) & 0x3);
+	pad     = (int)((h >> 9)  & 0x1);
+	chan    = (int)((h >> 6)  & 0x3);
+
+	if (version == 1 || layer != 1) return 0;              /* 保留版本 / 只支持 Layer III */
+	if (br_idx == 0 || br_idx == 15 || sr_idx == 3) return 0;
+	br = (version == 3) ? br_v1[br_idx] : br_v2[br_idx];
+	sr = (version == 3) ? sr_v1[sr_idx] : ((version == 2) ? sr_v2[sr_idx] : sr_v25[sr_idx]);
+	*hz = sr;
+	*ch = (chan == 3) ? 1 : 2;
+	/* 帧长 = 每帧样本/8 * 比特率 / 采样率 + 填充; Layer III: MPEG1=1152 样本, MPEG2/2.5=576 */
+	*flen = ((version == 3) ? (144u * br * 1000u / sr) : (72u * br * 1000u / sr)) + (uint32_t)pad;
+	return 1;
+}
+
+/* 在 buf 里找"真正的第一帧"起点。找到返回 1 并回传偏移/采样率/声道 */
+static int mp3_find_valid_frame(const uint8_t *buf, uint32_t len,
+                                uint32_t *off_out, uint32_t *hz_out, uint32_t *ch_out)
+{
+	uint32_t i, hz, ch, flen;
+	for (i = 0; i + 4 <= len; i++) {
+		if (!mp3_hdr_info(buf + i, &hz, &ch, &flen)) continue;
+		if (i + flen + 4 > len) return 0;          /* 缓冲里装不下第二帧, 本次无法确认 */
+		{
+			uint32_t hz2, ch2, flen2;
+			if (!mp3_hdr_info(buf + i + flen, &hz2, &ch2, &flen2)) continue;
+			if (hz2 != hz || ch2 != ch) continue;  /* 采样率/声道必须一致 */
+		}
+		*off_out = i; *hz_out = hz; *ch_out = ch;
+		return 1;
+	}
+	return 0;
+}
+
 /* 解码下一帧 MP3。成功返回每声道样本数(1152/576), 失败/结束返回 -1。 */
 static int mp3_decode_next_frame(void)
 {
@@ -1147,14 +1205,19 @@ static int mp3_decode_next_frame(void)
 
 		if (remaining < 4) return -1;   /* 数据不足(文件尾) */
 
-		/* 找同步字 */
-		off = MP3FindSyncWord(mp3_inbuf + mp3_inbuf_pos, (int)remaining);
-		if (off < 0) {
-			if (mp3_eof) return -1;
-			mp3_inbuf_pos = (mp3_inbuf_len > 2) ? (mp3_inbuf_len - 2) : mp3_inbuf_len;
-			continue;
+		/* ★找"真正的第一帧": 必须能连续解析出两个合法帧头(只找同步字会被封面图里的伪同步字骗到) */
+		{
+			uint32_t voff = 0, vhz = 0, vch = 0;
+			if (mp3_find_valid_frame(mp3_inbuf + mp3_inbuf_pos, remaining, &voff, &vhz, &vch)) {
+				mp3_inbuf_pos += voff;
+				if (mp3_hz == 0) { mp3_hz = vhz; mp3_channels = vch; }   /* 用帧头里的信息定采样率/声道 */
+			} else {
+				if (mp3_eof) return -1;
+				/* 缓冲内没有两个连续合法帧头: 往后挪再补数据重试 */
+				mp3_inbuf_pos = (mp3_inbuf_len > 2) ? (mp3_inbuf_len - 2) : mp3_inbuf_len;
+				continue;
+			}
 		}
-		mp3_inbuf_pos += (uint32_t)off;
 
 		/* 关键: 同步字后必须凑够整帧(含 reservoir), 否则整帧数据不全。
 		 * 把从同步字开始的数据移到缓冲头再补满, 然后重找同步字。 */
@@ -1311,10 +1374,16 @@ void mp3_file_process(file_list *ado_file)
 				 * 已读 mp3_inbuf_len 字节(在标签内), 只需再跳 tagsz - mp3_inbuf_len 字节到标签末尾。 */
 				uint32_t remain_skip = (tagsz > mp3_inbuf_len) ? (tagsz - mp3_inbuf_len) : 0;
 				uint8_t tmp[256];
+				int retry = 0;
 				while (remain_skip > 0) {
 					uint32_t want = (remain_skip > sizeof(tmp)) ? sizeof(tmp) : remain_skip;
 					UINT br2;
-					if (f_read(&SDFile, tmp, want, &br2) != FR_OK || br2 == 0) break;
+					if (f_read(&SDFile, tmp, want, &br2) != FR_OK || br2 == 0) {
+						/* 卡偶发读错时重试, 不要直接放弃: 放弃会把文件位置留在标签中间,
+						 * 解码器随后会把封面图里的伪同步字当真帧(实测会解出 16kHz 单声道垃圾)。 */
+						if (++retry > 5) break;
+						continue;
+					}
 					remain_skip -= br2;
 				}
 				mp3_inbuf_len = 0; mp3_inbuf_pos = 0;
