@@ -1,0 +1,31 @@
+# ---- 编译输出 / 中间产物 ----
+# Debug/ 里是 CubeIDE 的编译产物(本项目约 76MB), 绝对不要提交
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+*.cyclo
+
+# ---- 本机相关(Eclipse/CubeIDE 工作区、调试配置、含绝对路径的缓存) ----
+*.launch
+.settings/language.settings.xml
+mx.scratch
+
+# ---- 备份文件 ----
+*.bak
+*.bak2
+*.bak3
+*.ioc.bak
+.cproject.bak*
+.project.bak*
+
+# ---- 系统垃圾 ----
+Thumbs.db
+desktop.ini
+.DS_Store
