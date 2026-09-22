@@ -55,7 +55,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,   /* 1KB(原 512B 太紧: 任务里要 sprintf + OLED 取字 + USB 提示) */
   .priority = (osPriority_t) osPriorityNormal2,
 };
 
@@ -179,11 +179,14 @@ static void font_progress(uint32_t done, uint32_t total)
 
 static void FONT_BOOT(void)
 {
-  int rc;
+  int rc, frc;
 
   OLED_Clear();
   OLED_ShowString(1, 1, "字库检查中...");
   OLED_RefreshScreenWithScroll();
+
+  /* 先把 W25Q64 里已有的字库加载起来(没烧过也正常, 只是 valid=0) */
+  frc = font_store_init();
 
   if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
     rc = font_store_boot_check("0:/font16.bin", font_progress);
@@ -212,6 +215,11 @@ static void FONT_BOOT(void)
     OLED_ShowString(2, 1, "区段:");
     OLED_ShowNum(2, 6, font_store_ranges(), 2);
     OLED_ShowString(3, 1, "多语言已启用");
+  } else if (frc == -20) {          /* 字库存在但整段 CRC 校验不过 = 内容坏了 */
+    OLED_ShowString(1, 1, "字库校验失败");
+    OLED_ShowString(2, 1, "内容已损坏");
+    OLED_ShowString(3, 1, "把 font16.bin");
+    OLED_ShowString(4, 1, "放SD卡重新烧");
   } else {
     OLED_ShowString(1, 1, "字库未烧入");
     OLED_ShowString(2, 1, "把 font16.bin");
@@ -232,8 +240,8 @@ void StartDefaultTask(void *argument)
   if (scroll_timerHandle != NULL) {
     osTimerStart(scroll_timerHandle, 50);
   }
-  /* ★点阵字库: 从 W25Q64 加载; SD 根目录有 font16.bin 且内容不同则自动烧入并校验 */
-  FONT_BOOT();
+  /* 注: 字库检查/烧写放在 FILE_LOAD 任务里(见那里), 不要放这里 —— 本任务栈只有 1KB,
+   * 而字库流程要 sprintf + FatFs + OLED 取字, 之前放这里实测栈溢出(画完提示就黑屏)。 */
   uint8_t usb_was_connected = 0;
   /* Infinite loop */
   for(;;)
@@ -274,14 +282,31 @@ void AUDIO_READ(void *argument)
   /* USER CODE BEGIN AUDIO_READ */
   for(;;)
   {
-    OLED_Clear();
+    /* 先等扫描完成再清屏: 否则会把开机时的"字库检查/文件扫描"提示擦掉(表现为黑屏) */
     osSemaphoreAcquire(LOAD_DONE_OR_NOTHandle, osWaitForever);
+    OLED_Clear();
     while(1)
     {
       audio_file_read(&audiofiles[0]);
     }
   }
   /* USER CODE END AUDIO_READ */
+}
+
+/* 栈溢出钩子: 哪个任务栈被写穿就直接显示出来, 不要黑屏让人猜。
+ * 需在 FreeRTOSConfig.h 里把 configCHECK_FOR_STACK_OVERFLOW 设为 2。 */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void)xTask;
+  OLED_Clear();
+  OLED_ShowString(1, 1, "栈溢出!");
+  OLED_ShowString(2, 1, pcTaskName);
+  OLED_ShowString(3, 1, "该任务栈太小");
+  OLED_ShowString(4, 1, "需加大stack_size");
+  OLED_RefreshScreenWithScroll();
+  for (;;) {
+    osDelay(1000);          /* 停在这里, 让提示留在屏上 */
+  }
 }
 
 /* USER CODE BEGIN Header_FILE_LOAD */
@@ -293,6 +318,12 @@ void FILE_LOAD(void *argument)
 {
   /* USER CODE BEGIN FILE_LOAD */
   uint8_t sem_num=0, load_flag;
+
+  /* ★点阵字库: 先加载 W25Q64 里的字库; SD 根目录有 font16.bin 且内容不同则自动烧入并校验。
+   * 放在本任务(3KB 栈)而不是 defaultTask(1KB 栈): 这里要 sprintf + FatFs + OLED 取字,
+   * 栈小了会溢出(表现=开机画完"字库检查中..."就黑屏)。 */
+  FONT_BOOT();
+
   for(;;)
   {
     osSemaphoreAcquire(LOAD_OR_NOTHandle, osWaitForever);

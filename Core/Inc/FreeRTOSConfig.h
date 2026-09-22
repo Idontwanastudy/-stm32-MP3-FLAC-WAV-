@@ -78,6 +78,10 @@
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0
 #define configUSE_MUTEXES                        1
+/* ★栈溢出检测(2 = 任务切换时检查栈末尾填充字有没有被写穿)。
+ * 本工程曾因为 defaultTask 栈只有 512B 而"开机画完一句话就黑屏"——栈溢出静默踩了内存,
+ * 打开这个之后由 vApplicationStackOverflowHook 把出问题的任务名直接显示到 OLED 上。 */
+#define configCHECK_FOR_STACK_OVERFLOW           2
 #define configQUEUE_REGISTRY_SIZE                8
 #define configUSE_RECURSIVE_MUTEXES              1
 #define configUSE_COUNTING_SEMAPHORES            1
