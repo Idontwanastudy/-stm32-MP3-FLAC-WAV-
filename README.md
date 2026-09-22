@@ -74,6 +74,8 @@
 > **CODEC**：WM8960（I2C 寄存器控制型，24bit I2S 从模式，耳机输出）。
 > 注意它是**寄存器配置型**器件，上电默认 DAC / 输出驱动 / 混音器 / 音量几乎全关，必须由 MCU 写初始化序列才有声。
 > 板上另有 **独立 I2S 排针**，可外接 PCM5102a 这类硬件配置型 DAC 做 A/B 对比。
+>
+> 📐 **本板的完整硬件资料**（立创EDA 工程 / GERBER / BOM / 原理图）都在本仓库 [`Hardware/`](Hardware) 目录下。
 
 ### 时钟树
 
@@ -161,6 +163,12 @@ Music_player_F407ZGT6/
 ├── FATFS/                      # FatFs + SD 卡底层驱动(sd_diskio.c / bsp_driver_sd.c)
 ├── Middlewares/                # FreeRTOS / FatFs / libhelix-mp3
 ├── USB_DEVICE/                 # USB Mass Storage 设备
+├── Hardware/                   # ★ 硬件资料（本板完整设计）
+│   ├── 音乐播放器：STM32F407ZGT6-WM8960-工程开发板.eprj2   # 立创EDA(专业版)工程
+│   ├── hifimp3播放器GERBER/     # GERBER 打包（主板 / 功放板 / 按键板）
+│   ├── hifimp3 BOM/            # BOM 表（xlsx：主板 / 功放板 / 按键板）
+│   ├── 图纸/                   # 原理图 PDF（主板 / 功放板 / 按键板）
+│   └── 音乐播放器：..._backup/  # EDA 工程自动备份快照（历史版本）
 ├── Music_Player_F407ZGT6.ioc   # STM32CubeMX 工程文件
 ├── STM32F407ZGTX_FLASH.ld      # 链接脚本（128KB SRAM + 64KB CCM）
 ├── fix_fpu.bat                 # 兜底脚本：一键把 Debug makefile 的软浮点改硬浮点
