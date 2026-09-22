@@ -319,11 +319,14 @@ void FILE_LOAD(void *argument)
   /* USER CODE BEGIN FILE_LOAD */
   uint8_t sem_num=0, load_flag;
 
-  /* ★点阵字库: 先加载 W25Q64 里的字库; SD 根目录有 font16.bin 且内容不同则自动烧入并校验。
-   * 放在本任务(3KB 栈)而不是 defaultTask(1KB 栈): 这里要 sprintf + FatFs + OLED 取字,
-   * 栈小了会溢出(表现=开机画完"字库检查中..."就黑屏)。 */
-  FONT_BOOT();
-
+  /* ★点阵字库: 平时只从 W25Q64 加载"已经烧好的"字库(快, 完全不碰 SD 卡)。
+   * 需要更新字库时才走 SD: 把 font16.bin 放 SD 根目录, **开机时按住 PF7(音量+)不放**,
+   * 才会去检查/烧写(烧一次要 20~40 秒, 所以不放在常规启动路径上)。
+   * 字库没烧过也不影响使用: 中文走内 flash 的 GB2312 兜底, 只是没有俄/日/韩/繁体。 */
+  (void)font_store_init();
+  if (HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_7) == GPIO_PIN_RESET) {
+    FONT_BOOT();
+  }
   for(;;)
   {
     osSemaphoreAcquire(LOAD_OR_NOTHandle, osWaitForever);

@@ -166,8 +166,9 @@ python3 tools/gen_font.py --font NotoSansCJKsc-Regular.otf --out font16.bin
 #    不烧板子先看效果:  python3 tools/gen_font.py --font X.otf --preview "音AЖ漢한"
 #    只想先验证链路:    python3 tools/gen_font.py --selftest --out font16.bin   (几何图案自检字库)
 
-# 2) 把 font16.bin 放 SD 卡根目录, 插卡开机 → 自动校验CRC → 擦写 W25Q64 → 回读校验 → 显示"字库已更新"
-#    与 Flash 里内容相同会跳过(不会每次开机重复写); 烧完把文件从 SD 删掉也没关系
+# 2) 把 font16.bin 放 SD 卡根目录, **开机时按住 PF7(音量+)不放** → 才会走 SD 检查/烧写:
+#    校验CRC → 擦写 W25Q64(20~40秒, 有百分比) → 回读校验 → "字库已更新"
+#    ★平时开机不碰 SD(启动快): 只从 W25Q64 读已烧好的字库; 与 Flash 内容相同也会跳过不重烧
 
 # 3) 开机自检显示 "字库就绪 / 区段:n / 多语言已启用", 或 "字库未烧入 / 把 font16.bin 放SD卡根目录"
 ```
