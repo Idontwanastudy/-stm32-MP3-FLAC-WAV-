@@ -1,7 +1,7 @@
 #include "OLED_Font.h"
 #include "OLED.h"
 #include "cmsis_os.h"
-#include "OLED_GB2312_Quwei.h"   /* GB2312 区位码->Unicode 映射表 */
+#include "ff.h"                  /* ff_convert(): GBK(cp936)<->Unicode, 见下面 OLED_GBKString_To_UTF8 */
 
 /* GB2312 汉字字模库 (16x16, 每字32字节) + Unicode 索引表。
  * 该头文件由脚本 OLED_gen_font.py 生成(放入 Core/Inc)。
@@ -252,63 +252,14 @@ void OLED_ShowChinese(uint8_t Line, uint8_t Column, char *utf8)
   * @retval 无
   * @note   自动识别: ASCII 单字节走 OLED_ShowChar, 汉字双字节(0xA1-0xFE开头)查区位码
   */
+/* 显示 GBK 字符串(老接口, 保留兼容)。实现改为"先转 UTF-8 再交给 OLED_ShowString"——
+ * 这样走的是与 FatFs 同一套的 cp936 表, 假名/西里尔/繁体/日文汉字都能显示;
+ * 原来是直接用 GB2312 区位表(只填了汉字), 而且顺带把那 16KB 的旧表带进固件。 */
 void OLED_ShowGBKString(uint8_t Line, uint8_t Column, char *gbk)
 {
-	uint8_t *p = (uint8_t *)gbk;
-	uint16_t index;
-	while (*p != 0)
-	{
-		if (*p < 0x80)
-		{
-			/* ASCII: 直接显示, 占1列 */
-			OLED_ShowChar(Line, Column, (char)*p);
-			p++;
-			Column++;
-		}
-		else if (*p >= 0xA1 && *p <= 0xF7 && p[1] != 0)
-		{
-			/* GB2312 汉字双字节: 区号*p, 位号p[1] */
-			uint8_t qu = *p - 0xA1;
-			uint8_t wei = p[1] - 0xA1;
-			uint16_t idx = (uint16_t)qu * 94 + wei;
-			uint16_t unicode;
-
-			if (idx < 8178)
-			{
-				unicode = OLED_GB2312_QuweiUnicode[idx];
-				index = OLED_GB2312_GetIndex(unicode);
-			}
-			else
-			{
-				index = 0xFFFF;
-			}
-
-			if (index != 0xFFFF)
-			{
-				uint8_t i;
-				OLED_SetCursor((Line - 1) * 2, (Column - 1) * 8);       /* 上半页 */
-				for (i = 0; i < 16; i++)
-					OLED_WriteData(OLED_GB2312_FontData[index][i]);
-				OLED_SetCursor((Line - 1) * 2 + 1, (Column - 1) * 8);   /* 下半页 */
-				for (i = 16; i < 32; i++)
-					OLED_WriteData(OLED_GB2312_FontData[index][i]);
-			}
-			else
-			{
-				/* 字库没有这个字(繁体/日文/生僻字): 用 ?? 占位, 避免显示成空白 */
-				OLED_ShowChar(Line, (Column - 1) * 2 + 1, '?');
-				OLED_ShowChar(Line, (Column - 1) * 2 + 2, '?');
-			}
-			Column += 2;
-			p += 2;
-		}
-		else
-		{
-			/* 无法识别: 跳过1字节 */
-			p++;
-			Column++;
-		}
-	}
+	static char utf8[256];
+	OLED_GBKString_To_UTF8(gbk, utf8);
+	OLED_ShowString(Line, Column, utf8);
 }
 
 /**
@@ -771,34 +722,37 @@ void OLED_ShowScrollingString(char *utf8) {
  * @param  utf8_out 输出 UTF-8 字符串缓冲(需足够大, 中文最多3x输入长度)
  * @retval 无
  */
+/* 把 GBK/cp936 字符串转成 UTF-8(_LFN_UNICODE=0 时 FatFs 返回的文件名就是 GBK 编码)。
+ * ★必须用与 FatFs 同一套的 ff_convert(): 原来这里用的是 GB2312 区位码表, 而那张表**只填了汉字**,
+ *   1~9 区(全角字符/平假名/片假名/希腊/西里尔俄文)全是空的 → 俄语、日语歌名在屏上会变成 '?'。
+ *   ff_convert 的表覆盖完整 cp936: 假名/西里尔/全角/简繁日韩汉字都能转。 */
 void OLED_GBKString_To_UTF8(const char *gbk, char *utf8_out) {
 	const uint8_t *p = (const uint8_t *)gbk;
 	uint8_t *o = (uint8_t *)utf8_out;
 
 	while (*p != 0) {
+		uint16_t uni;
 		if (*p < 0x80) {
-			/* ASCII 直接拷贝 */
-			*o++ = *p++;
+			uni = *p++;                                   /* ASCII */
 		}
-		else if (*p >= 0xA1 && *p <= 0xF7 && p[1] != 0) {
-			/* GB2312 双字节汉字 */
-			uint8_t qu = *p++ - 0xA1;
-			uint8_t wei = *p++ - 0xA1;
-			uint16_t idx = (uint16_t)qu * 94 + wei;
-			uint16_t unicode = (idx < 8178) ? OLED_GB2312_QuweiUnicode[idx] : 0;
-			if (unicode != 0) {
-				/* Unicode -> UTF-8 三字节 */
-				*o++ = (uint8_t)(0xE0 | ((unicode >> 12) & 0x0F));
-				*o++ = (uint8_t)(0x80 | ((unicode >> 6) & 0x3F));
-				*o++ = (uint8_t)(0x80 | (unicode & 0x3F));
-			} else {
-				/* 超出 GB2312 的字符, 用 '?' 占位 */
-				*o++ = '?';
-			}
+		else if (p[1] != 0) {
+			uni = (uint16_t)ff_convert((WCHAR)(((uint16_t)p[0] << 8) | p[1]), 1);
+			p += 2;
+			if (uni == 0) { *o++ = '?'; continue; }        /* cp936 里没有的字符 → 占位 */
 		}
 		else {
-			/* 无法识别, 跳过 */
-			*o++ = *p++;
+			p++;                                          /* 落单的高字节, 跳过 */
+			continue;
+		}
+		if (uni < 0x80) {                                 /* Unicode -> UTF-8 */
+			*o++ = (uint8_t)uni;
+		} else if (uni < 0x800) {
+			*o++ = (uint8_t)(0xC0 | (uni >> 6));
+			*o++ = (uint8_t)(0x80 | (uni & 0x3F));
+		} else {
+			*o++ = (uint8_t)(0xE0 | ((uni >> 12) & 0x0F));
+			*o++ = (uint8_t)(0x80 | ((uni >> 6) & 0x3F));
+			*o++ = (uint8_t)(0x80 | (uni & 0x3F));
 		}
 	}
 	*o = 0;

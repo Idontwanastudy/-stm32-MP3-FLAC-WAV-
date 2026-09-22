@@ -304,9 +304,16 @@ uint8_t audio_file_load(void) {
             break;
         }
 
-        /* 取文件名: fname 即长文件名(含中文) */
-        {
-        	const TCHAR *name = SDFileInfo.fname;
+	        /* 取文件名: fname 即长文件名(含中文) */
+	        {
+	        	const TCHAR *name = SDFileInfo.fname;
+
+		        /* ★容错: 长名里若出现 '?'(说明有 cp936 转不了的字符, 例如韩文音节、emoji),
+		         * 用这个名字去 f_open 一定找不到文件 → 退回用 8.3 短名(ASCII, 一定能打开)。
+		         * 显示会变成 KOREAN~1.MP3 这种, 但至少能播。 */
+		        if (strchr(name, '?') != NULL && SDFileInfo.altname[0] != 0) {
+		        	name = SDFileInfo.altname;
+		        }
 
 	        /* 忽略子目录，只处理文件 */
 	        if (!(SDFileInfo.fattrib & AM_DIR)) {
@@ -317,7 +324,9 @@ uint8_t audio_file_load(void) {
 
 	            	if(file_count < max_size)
 	            	{
-	            		strcpy(audiofiles[file_count].audio_file_names, name);
+	            		/* 有界拷贝: 名字(GBK)可能比缓冲长, 直接 strcpy 会踩到相邻内存 */
+	            		strncpy(audiofiles[file_count].audio_file_names, name, max_length - 1);
+	            		audiofiles[file_count].audio_file_names[max_length - 1] = 0;
 	            		if(check_extension(name, "wav"))
 	            			strcpy(audiofiles[file_count].audio_file_type,"wav");
 	            		else if(check_extension(name, "mp3"))
