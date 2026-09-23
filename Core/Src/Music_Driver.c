@@ -101,7 +101,17 @@ static union {
 #if ENABLE_MP3
 volatile uint8_t mp3_play_ok = 0;   /* 0=MP3打开/首帧失败, 1=正常播放(供 audio_file_read 决定是否跳下一首) */
 static HMP3Decoder mp3_hdec = 0;             /* Helix 解码器句柄 */
-static uint8_t  mp3_inbuf[4096];             /* 压缩数据缓冲 */
+static uint8_t  mp3_inbuf[16384];            /* ★压缩数据缓冲 4096 → 16384
+                                                ── 为什么必须加大: 按 192kbps 算, **每播完一行(2048 帧/46.4ms)
+                                                正好消耗约 2088 字节**, 而原来缓冲只有 4096、补数据阈值 1940
+                                                ⇒ **几乎每一行填充都要同步读一次卡**; 实测一次读卡给填充加约 25ms,
+                                                于是每次填充 ≈ 解码 34ms + 读卡 25ms = **59ms > 一行窗口 46.4ms**
+                                                ⇒ 慢性亏空 ⇒ 环形 DMA 周期性重复旧行 ⇒ 变慢(实测 H/F = 641/504 = 1.27,
+                                                与 30s→38.2s 完全吻合)。
+                                                16384 后: 每约 6.9 行才读一次(每次约 14444 字节) ⇒ 平均每次填充
+                                                ≈ 34 + 25/6.9 ≈ 37.7ms < 46.4ms ✓ 回到窗口内。
+                                                (FLAC 早就用这味药治过同一症状: FLAC_IN_BUF_SIZE 4096→6144。)
+                                                RAM: +12KB, 仍余约 17KB。) */
 static uint32_t mp3_inbuf_len = 0;
 static uint32_t mp3_inbuf_pos = 0;
 static uint8_t  mp3_eof = 0;                 /* 文件读完标志 */
@@ -111,6 +121,16 @@ static uint32_t mp3_hz = 0;                  /* MP3 采样率 */
 static uint32_t mp3_total_frames = 0;        /* 已解码总样本数(全局样本计数) */
 static uint32_t mp3_frame_start = 0;         /* 当前帧全局起始样本 */
 static uint32_t mp3_frame_frames = 0;        /* 当前帧每声道样本数 */
+
+/* ★★★MP3 行重填的"计数器 + 交替行号"(取代原来的一对布尔标志 half_ready/full_ready)。
+ * 为什么必须这样改: 布尔标志只能表达"有没有", 无法表达"播完了几行" ——
+ *   一旦任务响应晚了(或被抢占), 同一个标志被置两次也只当一次 ⇒ 丢行 ⇒ 环形 DMA 重复旧行 ⇒ 变慢;
+ *   而若改成"先清零再填充"又会走到另一个极端(重复填同一行 ⇒ 跳内容 ⇒ 歌提前放完)。
+ * 计数器方案: 每个回调 = 播完一行(半=row0, 全=row1, 交替), 计数器 +1;
+ *   任务端按同样的交替顺序把"已播行数"补齐即可 —— **晚多久都不会丢、也不会重复**。 */
+static volatile uint32_t mp3_rows_done = 0;    /* ISR 累加: 硬件已播完的行数 */
+static uint32_t mp3_rows_filled = 0;           /* 任务端: 已按序重填的行数 */
+static uint8_t  mp3_fill_row = 0;              /* 下一个该填的行 (0/1 交替, 与回调顺序一致) */
 #endif /* ENABLE_MP3 */
 
 /* ============ 软件重采样状态 ============
@@ -304,9 +324,16 @@ uint8_t audio_file_load(void) {
             break;
         }
 
-        /* 取文件名: fname 即长文件名(含中文) */
-        {
-        	const TCHAR *name = SDFileInfo.fname;
+	        /* 取文件名: fname 即长文件名(含中文) */
+	        {
+	        	const TCHAR *name = SDFileInfo.fname;
+
+		        /* ★容错: 长名里若出现 '?'(说明有 cp936 转不了的字符, 例如韩文音节、emoji),
+		         * 用这个名字去 f_open 一定找不到文件 → 退回用 8.3 短名(ASCII, 一定能打开)。
+		         * 显示会变成 KOREAN~1.MP3 这种, 但至少能播。 */
+		        if (strchr(name, '?') != NULL && SDFileInfo.altname[0] != 0) {
+		        	name = SDFileInfo.altname;
+		        }
 
 	        /* 忽略子目录，只处理文件 */
 	        if (!(SDFileInfo.fattrib & AM_DIR)) {
@@ -317,7 +344,9 @@ uint8_t audio_file_load(void) {
 
 	            	if(file_count < max_size)
 	            	{
-	            		strcpy(audiofiles[file_count].audio_file_names, name);
+	            		/* 有界拷贝: 名字(GBK)可能比缓冲长, 直接 strcpy 会踩到相邻内存 */
+	            		strncpy(audiofiles[file_count].audio_file_names, name, max_length - 1);
+	            		audiofiles[file_count].audio_file_names[max_length - 1] = 0;
 	            		if(check_extension(name, "wav"))
 	            			strcpy(audiofiles[file_count].audio_file_type,"wav");
 	            		else if(check_extension(name, "mp3"))
@@ -1102,6 +1131,64 @@ int parse_wav_header(FIL *file, wav_file_parameters *header) {
 }
 
 #if ENABLE_MP3
+/* ================= MP3 帧头校验 =================
+ * ★为什么需要: 只靠"找同步字(0xFFEx)"定位第一帧是不可靠的——
+ *   ID3v2 里的内嵌封面(JPEG 的标记字节就是 FF E0~FF EF, 与 MP3 同步字一模一样!)会被误命中,
+ *   于是解码器把封面数据当音频流, 解出 16kHz/单声道的垃圾(实测: Queen 那首 504KB 封面的歌就是)。
+ *   对策: 候选同步字处必须能解析出**合法帧头**, 并且**按帧长跳到下一帧也是合法帧头且采样率/声道一致**
+ *   —— 伪造的同步字几乎不可能同时满足这两条。 */
+
+/* 解析 4 字节 MP3 帧头。合法返回 1, 并回传采样率/声道/帧长(字节) */
+static int mp3_hdr_info(const uint8_t *p, uint32_t *hz, uint32_t *ch, uint32_t *flen)
+{
+	static const uint16_t br_v1[16] = {0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0};   /* MPEG1 Layer3 kbps */
+	static const uint16_t br_v2[16] = {0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0};        /* MPEG2/2.5 Layer3 */
+	static const uint16_t sr_v1[3]  = {44100,48000,32000};
+	static const uint16_t sr_v2[3]  = {22050,24000,16000};
+	static const uint16_t sr_v25[3] = {11025,12000,8000};
+	uint32_t h;
+	int version, layer, br_idx, sr_idx, pad, chan;
+	uint32_t br, sr;
+
+	if (p[0] != 0xFF || (p[1] & 0xE0) != 0xE0) return 0;
+	h = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+	version = (int)((h >> 19) & 0x3);
+	layer   = (int)((h >> 17) & 0x3);
+	br_idx  = (int)((h >> 12) & 0xF);
+	sr_idx  = (int)((h >> 10) & 0x3);
+	pad     = (int)((h >> 9)  & 0x1);
+	chan    = (int)((h >> 6)  & 0x3);
+
+	if (version == 1 || layer != 1) return 0;              /* 保留版本 / 只支持 Layer III */
+	if (br_idx == 0 || br_idx == 15 || sr_idx == 3) return 0;
+	br = (version == 3) ? br_v1[br_idx] : br_v2[br_idx];
+	sr = (version == 3) ? sr_v1[sr_idx] : ((version == 2) ? sr_v2[sr_idx] : sr_v25[sr_idx]);
+	*hz = sr;
+	*ch = (chan == 3) ? 1 : 2;
+	/* 帧长 = 每帧样本/8 * 比特率 / 采样率 + 填充; Layer III: MPEG1=1152 样本, MPEG2/2.5=576 */
+	*flen = ((version == 3) ? (144u * br * 1000u / sr) : (72u * br * 1000u / sr)) + (uint32_t)pad;
+	return 1;
+}
+
+/* 在 buf 里找"真正的第一帧"起点。找到返回 1 并回传偏移/采样率/声道 */
+static int mp3_find_valid_frame(const uint8_t *buf, uint32_t len,
+                                uint32_t *off_out, uint32_t *hz_out, uint32_t *ch_out)
+{
+	uint32_t i, hz, ch, flen;
+	for (i = 0; i + 4 <= len; i++) {
+		if (!mp3_hdr_info(buf + i, &hz, &ch, &flen)) continue;
+		if (i + flen + 4 > len) return 0;          /* 缓冲里装不下第二帧, 本次无法确认 */
+		{
+			uint32_t hz2, ch2, flen2;
+			if (!mp3_hdr_info(buf + i + flen, &hz2, &ch2, &flen2)) continue;
+			if (hz2 != hz || ch2 != ch) continue;  /* 采样率/声道必须一致 */
+		}
+		*off_out = i; *hz_out = hz; *ch_out = ch;
+		return 1;
+	}
+	return 0;
+}
+
 /* 解码下一帧 MP3。成功返回每声道样本数(1152/576), 失败/结束返回 -1。 */
 static int mp3_decode_next_frame(void)
 {
@@ -1138,14 +1225,19 @@ static int mp3_decode_next_frame(void)
 
 		if (remaining < 4) return -1;   /* 数据不足(文件尾) */
 
-		/* 找同步字 */
-		off = MP3FindSyncWord(mp3_inbuf + mp3_inbuf_pos, (int)remaining);
-		if (off < 0) {
-			if (mp3_eof) return -1;
-			mp3_inbuf_pos = (mp3_inbuf_len > 2) ? (mp3_inbuf_len - 2) : mp3_inbuf_len;
-			continue;
+		/* ★找"真正的第一帧": 必须能连续解析出两个合法帧头(只找同步字会被封面图里的伪同步字骗到) */
+		{
+			uint32_t voff = 0, vhz = 0, vch = 0;
+			if (mp3_find_valid_frame(mp3_inbuf + mp3_inbuf_pos, remaining, &voff, &vhz, &vch)) {
+				mp3_inbuf_pos += voff;
+				if (mp3_hz == 0) { mp3_hz = vhz; mp3_channels = vch; }   /* 用帧头里的信息定采样率/声道 */
+			} else {
+				if (mp3_eof) return -1;
+				/* 缓冲内没有两个连续合法帧头: 往后挪再补数据重试 */
+				mp3_inbuf_pos = (mp3_inbuf_len > 2) ? (mp3_inbuf_len - 2) : mp3_inbuf_len;
+				continue;
+			}
 		}
-		mp3_inbuf_pos += (uint32_t)off;
 
 		/* 关键: 同步字后必须凑够整帧(含 reservoir), 否则整帧数据不全。
 		 * 把从同步字开始的数据移到缓冲头再补满, 然后重找同步字。 */
@@ -1174,9 +1266,20 @@ static int mp3_decode_next_frame(void)
 			mp3_total_frames += mp3_frame_frames;
 			return (int)mp3_frame_frames;
 		}
-		/* 数据不足类错误: 回循环顶补数据再试(不跳字节, 否则流错位) */
-		if ((err == ERR_MP3_INDATA_UNDERFLOW || err == ERR_MP3_MAINDATA_UNDERFLOW) && !mp3_eof) {
+		/* ★两类"数据不足"错误要分开处理 —— 它们"是否已消费输入"的语义不同(依据 Helix mp3dec.c):
+		 * ERR_MP3_INDATA_UNDERFLOW  : 整帧还没凑齐, Helix 没动 *inbuf ⇒ 不能跳字节, 回顶部补数据再试。
+		 * ERR_MP3_MAINDATA_UNDERFLOW: Helix **返回前已经把 *inbuf 前进了整帧的 nSlots**,
+		 *   并且把这帧主数据 memcpy 进了它自己的 mainBuf(bit reservoir)。所以必须按"已消费"处理!
+		 *   原来把它和上面那类一起 continue(注释写"不跳字节"), 结果这一帧会被再喂一次:
+		 *   Helix 内部 reservoir 里同一帧数据被写两遍 → 之后解出来的样本是错的。
+		 *   (该错误只在"开头 reservoir 还不够"时出现; 顺带说明: 光看症状像"跳帧/重解"时, 值得核对这类契约。) */
+		if (err == ERR_MP3_INDATA_UNDERFLOW && !mp3_eof) {
 			continue;
+		}
+		if (err == ERR_MP3_MAINDATA_UNDERFLOW) {
+			mp3_inbuf_pos = (uint32_t)(ptr - mp3_inbuf);   /* 按"Helix 已消费"处理 */
+			if (!mp3_eof) continue;
+			return -1;
 		}
 		/* 其它错误: 跳 1 字节重同步 */
 		mp3_inbuf_pos++;
@@ -1248,6 +1351,8 @@ static void mp3_fill_buffer_region(uint16_t *start, uint16_t num_halfwords)
 	}
 }
 
+
+
 void mp3_file_process(file_list *ado_file)
 {
 	char full_path[128] = {0};
@@ -1302,10 +1407,16 @@ void mp3_file_process(file_list *ado_file)
 				 * 已读 mp3_inbuf_len 字节(在标签内), 只需再跳 tagsz - mp3_inbuf_len 字节到标签末尾。 */
 				uint32_t remain_skip = (tagsz > mp3_inbuf_len) ? (tagsz - mp3_inbuf_len) : 0;
 				uint8_t tmp[256];
+				int retry = 0;
 				while (remain_skip > 0) {
 					uint32_t want = (remain_skip > sizeof(tmp)) ? sizeof(tmp) : remain_skip;
 					UINT br2;
-					if (f_read(&SDFile, tmp, want, &br2) != FR_OK || br2 == 0) break;
+					if (f_read(&SDFile, tmp, want, &br2) != FR_OK || br2 == 0) {
+						/* 卡偶发读错时重试, 不要直接放弃: 放弃会把文件位置留在标签中间,
+						 * 解码器随后会把封面图里的伪同步字当真帧(实测会解出 16kHz 单声道垃圾)。 */
+						if (++retry > 5) break;
+						continue;
+					}
 					remain_skip -= br2;
 				}
 				mp3_inbuf_len = 0; mp3_inbuf_pos = 0;
@@ -1351,6 +1462,10 @@ void mp3_file_process(file_list *ado_file)
 	actual_rate = i2s_set_sample_rate(mp3_hz);
 	resample_step = (uint32_t)(((uint64_t)mp3_hz << RESAMPLE_FRAC_BITS) / actual_rate);
 	resample_pos = 0;
+	/* 行计数器归零(DMA 从 row0 起播, 第一次回调是"半" = row0 播完) */
+	mp3_rows_done   = 0;
+	mp3_rows_filled = 0;
+	mp3_fill_row    = 0;
 	force_i2s_config();
 	mp3_fill_buffer_region(audio_buffer[0], AUDIO_BUF_SIZE);
 	mp3_fill_buffer_region(audio_buffer[1], AUDIO_BUF_SIZE);
@@ -1393,9 +1508,33 @@ void mp3_file_process(file_list *ado_file)
 			if (g_sd_io_err) { g_sd_io_err = 0; audio_stop(); file_ended = 1; break; }
 			if (seek_speed < 0) seek_speed = 0;   /* MP3 不支持快退 */
 			seek_update_display(ado_file);
-			if (half_ready) { mp3_fill_buffer_region(audio_buffer[0], AUDIO_BUF_SIZE); half_ready = 0; }
-			if (full_ready) { mp3_fill_buffer_region(audio_buffer[1], AUDIO_BUF_SIZE); full_ready = 0; }
-			if (!half_ready && !full_ready) osDelay(1);
+			/* ★★★先清零、再填充 —— 这两行的顺序是本 bug 的正解, 千万不要改回去!
+			 * 原来是"先填充、后清零": 填充要 11~21ms, 清零在填充之后 ——
+			 *   于是**填充期间到达的那个回调所设置的标志, 会被随后的清零一起抹掉**,
+			 *   那一次重填就被丢掉 → 环形 DMA 没有新数据 → 只好把旧行再播一遍 → 时间被拉长。
+			 * 实测佐证: H(硬件播过的行数)/F(软件填过的行数) = 877/616 = **1.42**, 与音频量到的
+			 *   慢速倍数、以及"丢弃比例 261/877 = 29.8% ≈ 窗口占比 12~23%×2"三者互相吻合;
+			 *   而 PK(最差填充) 只有 21ms « 一行窗口 46.4ms ⇒ 不是"填充慢", 就是丢标志。
+			 * 改成"先清零": 填充期间到达的回调会把标志**重新置 1**, 下一轮再填一次 —— 不会丢。
+			 * (安全: 回调意味着"这一行刚播完", 立刻重填不会覆盖正在播的行; 填充 21ms 也远小于 2 行 92.8ms。) */
+			/* ★★★按"已播行数"把该重填的行补齐 —— 用计数器, 不用布尔标志。
+			 * ★每轮最多补 2 行, 且之后**无条件** osDelay(1):
+			 *   否则一旦填充跟不上(补不完), 这个 while 就永远出不去 ⇒ 整个音频任务卡死在填充里 ⇒
+			 *     ① 按键(上一首/下一首/停止)全都不响应;
+			 *     ② 低优先级任务被全部饿死(OLED 滚动字幕 / 音量键轮询 / USB 状态轮询全停摆)。
+			 *   无条件让出 1ms 的代价可以忽略(一次填充要 15~66ms), 换来的是整机不会"闷死"。 */
+			{
+				uint32_t budget = 2;   /* 每轮最多补 2 行 */
+				while (mp3_rows_filled != mp3_rows_done && budget != 0) {
+					uint8_t r = mp3_fill_row;
+					mp3_fill_row ^= 1;          /* 与回调顺序一致: row0 → row1 → row0 … */
+					mp3_rows_filled++;
+					budget--;
+					mp3_fill_buffer_region(audio_buffer[r], AUDIO_BUF_SIZE);
+					if (file_ended) break;      /* 解码到头: 交给外层收尾 */
+				}
+				osDelay(1);   /* ★无条件让出: 保证按键、定时器任务(诊断显示/USB 轮询)不被饿死 */
+			}
 		}
 	}
 
@@ -1582,12 +1721,14 @@ void audio_stop(void) {
 
 void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-	half_ready = 1;
+	mp3_rows_done++;    /* ★播完一行(row0) —— 计数器方案的核心: 每个回调都算一行, 不会丢 */
+	half_ready = 1;     /* 保留给 WAV/FLAC 用的老标志 */
 }
 
 void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-	full_ready = 1;
+	mp3_rows_done++;    /* ★播完一行(row1) */
+	full_ready = 1;     /* 保留给 WAV/FLAC 用的老标志 */
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)

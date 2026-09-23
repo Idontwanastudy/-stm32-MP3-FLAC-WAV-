@@ -25,6 +25,8 @@
 #include "Music_Driver.h"
 #include "OLED.h"
 #include "wm8960.h"    /* 音量键 PF7/PF8 → I2C 调 WM8960 音量 */
+#include "font_store.h" /* W25Q64 点阵字库: 上电加载 / 从 SD 卡烧写 */
+#include "fatfs.h"
 #include "timers.h"
 #include "usbd_storage_if.h"
 #include "usbd_core.h"
@@ -53,7 +55,7 @@ extern USBD_HandleTypeDef hUsbDeviceFS;
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,   /* 1KB(原 512B 太紧: 任务里要 sprintf + OLED 取字 + USB 提示) */
   .priority = (osPriority_t) osPriorityNormal2,
 };
 
@@ -66,7 +68,11 @@ const osThreadAttr_t audio_file_read_attributes = {
   .name = "audio_file_read",
   .stack_size = 2048 * 4,   /* 8KB: Helix 定点解码器栈需求极小(MP3Decode 仅 112 字节, 全库最大 448),
                                原来 32KB 是为 minimp3(需 17.5KB 栈)留的, 换 Helix 后可大幅缩小 */
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t) osPriorityNormal3,   /* ★原为 osPriorityNormal: 比 defaultTask(Normal2)、
+                                                    FILE_LOAD(Normal1) 都低 → 填充缓冲时可被它们抢。
+                                                    MP3 每行只有 46.4ms 的填充窗口, 被抢一下就欠载
+                                                    (环形 DMA 会重复旧数据 → 听感变慢)。
+                                                    提到所有应用任务之上(仍低于中断/定时器任务)。 */
 };
 osThreadId_t audio_file_loadHandle;
 const osThreadAttr_t audio_file_load_attributes = {
@@ -160,6 +166,74 @@ void MX_FREERTOS_Init(void) {
   * @param  argument: Not used
   * @retval None
   */
+/* ================= 点阵字库(W25Q64) 上电加载 / 从 SD 卡烧写 =================
+ * 用法: 把 tools/gen_font.py 生成的 font16.bin 放到 SD 卡根目录, 开机自动烧进 W25Q64 并校验;
+ *       之后把文件从 SD 卡删掉也没关系(Flash 里已经有了)。内容相同会跳过, 不会每次开机重复写。
+ * 注意: 下面这些提示文字本身由内 flash 的 8x16 + GB2312 兜底字库显示, 所以字库还没烧入时也能正常提示。 */
+static void font_progress(uint32_t done, uint32_t total)
+{
+  char buf[20];
+  if (total == 0) return;
+  sprintf(buf, "%lu%%", (unsigned long)((done * 100u) / total));
+  OLED_ShowString(3, 1, "烧写字库");
+  OLED_ShowString(3, 10, "     ");
+  OLED_ShowString(3, 10, buf);
+  OLED_RefreshScreenWithScroll();
+}
+
+static void FONT_BOOT(void)
+{
+  int rc, frc;
+
+  OLED_Clear();
+  OLED_ShowString(1, 1, "字库检查中...");
+  OLED_RefreshScreenWithScroll();
+
+  /* 先把 W25Q64 里已有的字库加载起来(没烧过也正常, 只是 valid=0) */
+  frc = font_store_init();
+
+  if (f_mount(&SDFatFS, SDPath, 1) == FR_OK) {
+    rc = font_store_boot_check("0:/font16.bin", font_progress);
+    if (rc == 1) {                        /* 本次烧写成功 */
+      OLED_Clear();
+      OLED_ShowString(1, 1, "字库已更新");
+      OLED_ShowString(2, 1, "字节:");
+      OLED_ShowNum(2, 6, font_store_size(), 7);
+      OLED_RefreshScreenWithScroll();
+      osDelay(1200);
+    } else if (rc < 0) {                  /* 烧写出错 */
+      OLED_Clear();
+      OLED_ShowString(1, 1, "字库写入失败");
+      OLED_ShowString(2, 1, "错误码:");
+      OLED_ShowNum(2, 8, (uint32_t)(-rc), 2);
+      OLED_ShowString(3, 1, "检查SD卡上的");
+      OLED_ShowString(4, 1, "font16.bin");
+      OLED_RefreshScreenWithScroll();
+      osDelay(2000);
+    }
+  }
+
+  OLED_Clear();
+  if (font_store_ready()) {
+    OLED_ShowString(1, 1, "字库就绪");
+    OLED_ShowString(2, 1, "区段:");
+    OLED_ShowNum(2, 6, font_store_ranges(), 2);
+    OLED_ShowString(3, 1, "多语言已启用");
+  } else if (frc == -20) {          /* 字库存在但整段 CRC 校验不过 = 内容坏了 */
+    OLED_ShowString(1, 1, "字库校验失败");
+    OLED_ShowString(2, 1, "内容已损坏");
+    OLED_ShowString(3, 1, "把 font16.bin");
+    OLED_ShowString(4, 1, "放SD卡重新烧");
+  } else {
+    OLED_ShowString(1, 1, "字库未烧入");
+    OLED_ShowString(2, 1, "把 font16.bin");
+    OLED_ShowString(3, 1, "放SD卡根目录");
+    OLED_ShowString(4, 1, "再开机");
+  }
+  OLED_RefreshScreenWithScroll();
+  osDelay(1200);
+}
+
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
@@ -170,6 +244,8 @@ void StartDefaultTask(void *argument)
   if (scroll_timerHandle != NULL) {
     osTimerStart(scroll_timerHandle, 50);
   }
+  /* 注: 字库检查/烧写放在 FILE_LOAD 任务里(见那里), 不要放这里 —— 本任务栈只有 1KB,
+   * 而字库流程要 sprintf + FatFs + OLED 取字, 之前放这里实测栈溢出(画完提示就黑屏)。 */
   uint8_t usb_was_connected = 0;
   /* Infinite loop */
   for(;;)
@@ -210,14 +286,31 @@ void AUDIO_READ(void *argument)
   /* USER CODE BEGIN AUDIO_READ */
   for(;;)
   {
-    OLED_Clear();
+    /* 先等扫描完成再清屏: 否则会把开机时的"字库检查/文件扫描"提示擦掉(表现为黑屏) */
     osSemaphoreAcquire(LOAD_DONE_OR_NOTHandle, osWaitForever);
+    OLED_Clear();
     while(1)
     {
       audio_file_read(&audiofiles[0]);
     }
   }
   /* USER CODE END AUDIO_READ */
+}
+
+/* 栈溢出钩子: 哪个任务栈被写穿就直接显示出来, 不要黑屏让人猜。
+ * 需在 FreeRTOSConfig.h 里把 configCHECK_FOR_STACK_OVERFLOW 设为 2。 */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void)xTask;
+  OLED_Clear();
+  OLED_ShowString(1, 1, "栈溢出!");
+  OLED_ShowString(2, 1, pcTaskName);
+  OLED_ShowString(3, 1, "该任务栈太小");
+  OLED_ShowString(4, 1, "需加大stack_size");
+  OLED_RefreshScreenWithScroll();
+  for (;;) {
+    osDelay(1000);          /* 停在这里, 让提示留在屏上 */
+  }
 }
 
 /* USER CODE BEGIN Header_FILE_LOAD */
@@ -229,6 +322,15 @@ void FILE_LOAD(void *argument)
 {
   /* USER CODE BEGIN FILE_LOAD */
   uint8_t sem_num=0, load_flag;
+
+  /* ★点阵字库: 平时只从 W25Q64 加载"已经烧好的"字库(快, 完全不碰 SD 卡)。
+   * 需要更新字库时才走 SD: 把 font16.bin 放 SD 根目录, **开机时按住 PF7(音量+)不放**,
+   * 才会去检查/烧写(烧一次要 20~40 秒, 所以不放在常规启动路径上)。
+   * 字库没烧过也不影响使用: 中文走内 flash 的 GB2312 兜底, 只是没有俄/日/韩/繁体。 */
+  (void)font_store_init();
+  if (HAL_GPIO_ReadPin(GPIOF, GPIO_PIN_7) == GPIO_PIN_RESET) {
+    FONT_BOOT();
+  }
   for(;;)
   {
     osSemaphoreAcquire(LOAD_OR_NOTHandle, osWaitForever);
@@ -341,6 +443,7 @@ void OLED_SCROLL_Callback(void *argument)
       vol_key = 0;                               /* 松开 */
     }
   }
+
 
   /* ===== 歌名滚动 (每 2 次推进一列 ~100ms) ===== */
   if (scrollTextWidth > 128)

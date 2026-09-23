@@ -15,7 +15,7 @@
  * 0=禁用(F103 内存受限时的旧设置)。 */
 #define ENABLE_FLAC 1
 
-/* MP3 支持开关: 1=启用 (minimp3 解码器) */
+/* MP3 支持开关: 1=启用 (Helix 定点解码器) */
 #define ENABLE_MP3 1
 
 #define max_size 100        /* 文件列表上限 (禁用FLAC后恢复为100) */
@@ -94,7 +94,6 @@ extern volatile uint8_t  key_prev_down;   /* PE0 上一首 按下状态 */
 extern volatile uint8_t  key_next_down;   /* PE1 下一首 按下状态 */
 extern volatile uint32_t key_prev_tick;   /* PE0 按下时刻 */
 extern volatile uint32_t key_next_tick;   /* PE1 按下时刻 */
-
 
 uint8_t check_extension(const char *name, const char *ext);
 uint8_t audio_file_load(void);

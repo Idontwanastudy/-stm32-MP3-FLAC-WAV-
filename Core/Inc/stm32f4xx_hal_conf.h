@@ -96,7 +96,13 @@
   *        (when HSE is used as system clock source, directly or through the PLL).
   */
 #if !defined  (HSE_VALUE)
-  #define HSE_VALUE    25000000U /*!< Value of the External oscillator in Hz */
+  #define HSE_VALUE    8000000U  /*!< ★本板是 8MHz 晶振(原值 25000000U 是 CubeMX 默认, 没改)。
+                                     这个值不只是"算着玩": HAL_RCC_GetSysClockFreq() 用它反推
+                                     SystemCoreClock —— 写 25M 会让 SystemCoreClock 算成 525MHz
+                                     (真实 168MHz, 差 3.125 倍); 而它又是 FreeRTOS 的 configCPU_CLOCK_HZ,
+                                     于是系统节拍变成 320Hz 而不是 1000Hz, 所有 osDelay/HAL_GetTick
+                                     都比真实时间大 3.125 倍 —— 实测所有 DWT 计时都偏小 3.125 倍,
+                                     就是这个原因。 */
 #endif /* HSE_VALUE */
 
 #if !defined  (HSE_STARTUP_TIMEOUT)
