@@ -68,7 +68,11 @@ const osThreadAttr_t audio_file_read_attributes = {
   .name = "audio_file_read",
   .stack_size = 2048 * 4,   /* 8KB: Helix 定点解码器栈需求极小(MP3Decode 仅 112 字节, 全库最大 448),
                                原来 32KB 是为 minimp3(需 17.5KB 栈)留的, 换 Helix 后可大幅缩小 */
-  .priority = (osPriority_t) osPriorityNormal,
+  .priority = (osPriority_t) osPriorityNormal3,   /* ★原为 osPriorityNormal: 比 defaultTask(Normal2)、
+                                                    FILE_LOAD(Normal1) 都低 → 填充缓冲时可被它们抢。
+                                                    MP3 每行只有 46.4ms 的填充窗口, 被抢一下就欠载
+                                                    (环形 DMA 会重复旧数据 → 听感变慢)。
+                                                    提到所有应用任务之上(仍低于中断/定时器任务)。 */
 };
 osThreadId_t audio_file_loadHandle;
 const osThreadAttr_t audio_file_load_attributes = {
@@ -439,6 +443,19 @@ void OLED_SCROLL_Callback(void *argument)
       vol_key = 0;                               /* 松开 */
     }
   }
+
+#if MP3_FILL_DIAG && ENABLE_MP3
+  /* ===== MP3 填充耗时诊断: 每秒刷一次 (限流, 否则 I2C 会拖垮实时性) =====
+   * 显示放在这个低优先级定时器任务里做, 音频任务只写变量、绝不碰 I2C。 */
+  {
+    static uint8_t diag_div = 0;
+    if (mp3_diag_active) {
+      if (++diag_div >= 20) { diag_div = 0; mp3_diag_show(); }   /* 50ms × 20 = 1s */
+    } else {
+      diag_div = 0;
+    }
+  }
+#endif
 
   /* ===== 歌名滚动 (每 2 次推进一列 ~100ms) ===== */
   if (scrollTextWidth > 128)

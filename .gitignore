@@ -33,3 +33,7 @@ desktop.ini
 # 生成的字库(放到 SD 卡根目录用, 不属于源码)
 font16.bin
 tools/*.bin
+测试音.wav
+测试音.mp3
+测试音_320k.mp3
+测试音_96k.mp3

@@ -101,7 +101,17 @@ static union {
 #if ENABLE_MP3
 volatile uint8_t mp3_play_ok = 0;   /* 0=MP3打开/首帧失败, 1=正常播放(供 audio_file_read 决定是否跳下一首) */
 static HMP3Decoder mp3_hdec = 0;             /* Helix 解码器句柄 */
-static uint8_t  mp3_inbuf[4096];             /* 压缩数据缓冲 */
+static uint8_t  mp3_inbuf[16384];            /* ★压缩数据缓冲 4096 → 16384
+                                                ── 为什么必须加大: 按 192kbps 算, **每播完一行(2048 帧/46.4ms)
+                                                正好消耗约 2088 字节**, 而原来缓冲只有 4096、补数据阈值 1940
+                                                ⇒ **几乎每一行填充都要同步读一次卡**; 实测一次读卡给填充加约 25ms,
+                                                于是每次填充 ≈ 解码 34ms + 读卡 25ms = **59ms > 一行窗口 46.4ms**
+                                                ⇒ 慢性亏空 ⇒ 环形 DMA 周期性重复旧行 ⇒ 变慢(实测 H/F = 641/504 = 1.27,
+                                                与 30s→38.2s 完全吻合)。
+                                                16384 后: 每约 6.9 行才读一次(每次约 14444 字节) ⇒ 平均每次填充
+                                                ≈ 34 + 25/6.9 ≈ 37.7ms < 46.4ms ✓ 回到窗口内。
+                                                (FLAC 早就用这味药治过同一症状: FLAC_IN_BUF_SIZE 4096→6144。)
+                                                RAM: +12KB, 仍余约 17KB。) */
 static uint32_t mp3_inbuf_len = 0;
 static uint32_t mp3_inbuf_pos = 0;
 static uint8_t  mp3_eof = 0;                 /* 文件读完标志 */
@@ -111,6 +121,16 @@ static uint32_t mp3_hz = 0;                  /* MP3 采样率 */
 static uint32_t mp3_total_frames = 0;        /* 已解码总样本数(全局样本计数) */
 static uint32_t mp3_frame_start = 0;         /* 当前帧全局起始样本 */
 static uint32_t mp3_frame_frames = 0;        /* 当前帧每声道样本数 */
+
+/* ★★★MP3 行重填的"计数器 + 交替行号"(取代原来的一对布尔标志 half_ready/full_ready)。
+ * 为什么必须这样改: 布尔标志只能表达"有没有", 无法表达"播完了几行" ——
+ *   一旦任务响应晚了(或被抢占), 同一个标志被置两次也只当一次 ⇒ 丢行 ⇒ 环形 DMA 重复旧行 ⇒ 变慢;
+ *   而若改成"先清零再填充"又会走到另一个极端(重复填同一行 ⇒ 跳内容 ⇒ 歌提前放完)。
+ * 计数器方案: 每个回调 = 播完一行(半=row0, 全=row1, 交替), 计数器 +1;
+ *   任务端按同样的交替顺序把"已播行数"补齐即可 —— **晚多久都不会丢、也不会重复**。 */
+static volatile uint32_t mp3_rows_done = 0;    /* ISR 累加: 硬件已播完的行数 */
+static uint32_t mp3_rows_filled = 0;           /* 任务端: 已按序重填的行数 */
+static uint8_t  mp3_fill_row = 0;              /* 下一个该填的行 (0/1 交替, 与回调顺序一致) */
 #endif /* ENABLE_MP3 */
 
 /* ============ 软件重采样状态 ============
@@ -1246,9 +1266,20 @@ static int mp3_decode_next_frame(void)
 			mp3_total_frames += mp3_frame_frames;
 			return (int)mp3_frame_frames;
 		}
-		/* 数据不足类错误: 回循环顶补数据再试(不跳字节, 否则流错位) */
-		if ((err == ERR_MP3_INDATA_UNDERFLOW || err == ERR_MP3_MAINDATA_UNDERFLOW) && !mp3_eof) {
+		/* ★两类"数据不足"错误要分开处理 —— 它们"是否已消费输入"的语义不同(依据 Helix mp3dec.c):
+		 * ERR_MP3_INDATA_UNDERFLOW  : 整帧还没凑齐, Helix 没动 *inbuf ⇒ 不能跳字节, 回顶部补数据再试。
+		 * ERR_MP3_MAINDATA_UNDERFLOW: Helix **返回前已经把 *inbuf 前进了整帧的 nSlots**,
+		 *   并且把这帧主数据 memcpy 进了它自己的 mainBuf(bit reservoir)。所以必须按"已消费"处理!
+		 *   原来把它和上面那类一起 continue(注释写"不跳字节"), 结果这一帧会被再喂一次:
+		 *   Helix 内部 reservoir 里同一帧数据被写两遍 → 之后解出来的样本是错的。
+		 *   (该错误只在"开头 reservoir 还不够"时出现; 顺带说明: 光看症状像"跳帧/重解"时, 值得核对这类契约。) */
+		if (err == ERR_MP3_INDATA_UNDERFLOW && !mp3_eof) {
 			continue;
+		}
+		if (err == ERR_MP3_MAINDATA_UNDERFLOW) {
+			mp3_inbuf_pos = (uint32_t)(ptr - mp3_inbuf);   /* 按"Helix 已消费"处理 */
+			if (!mp3_eof) continue;
+			return -1;
 		}
 		/* 其它错误: 跳 1 字节重同步 */
 		mp3_inbuf_pos++;
@@ -1318,6 +1349,105 @@ static void mp3_fill_buffer_region(uint16_t *start, uint16_t num_halfwords)
 			produced++;
 		}
 	}
+}
+
+/* =================  MP3 填充耗时诊断 (MP3_FILL_DIAG)  =================
+ * 一行缓冲的播放时长 = (AUDIO_BUF_SIZE/4) 帧 ÷ 实际输出采样率。
+ *   填充耗时 < 播放时长 → 跟得上;
+ *   填充耗时 > 播放时长 → 环形 I2S DMA 绕回去重复旧数据 = "变慢但音高不变"。
+ * 计时只在音频任务里读寄存器(无 I2C), 显示交给滚动定时器任务每秒刷一次。 */
+#if MP3_FILL_DIAG
+volatile uint32_t mp3_diag_fill_us     = 0;   /* 最近一次填充耗时 (µs) */
+volatile uint32_t mp3_diag_fill_us_max = 0;   /* 本秒内最差 (µs) */
+volatile uint32_t mp3_diag_fill_us_sum = 0;   /* ★累计填充耗时 (µs) —— 用来算"平均每次填充多久"。
+                                               * **平均**才是决定"跟不跟得上"的量:
+                                               *   平均 < 46.4ms(一行窗口) ⇒ 理论跟得上, 欠账另有原因(调度/逻辑);
+                                               *   平均 > 46.4ms           ⇒ 填充本身就不够快(解码？读卡？),
+                                               *   且欠账比例应约等于 平均/46.4 —— 与 H/F 对照即可确认。 */
+volatile uint32_t mp3_diag_row_us      = 0;   /* 一行缓冲的"应有"播放时长 (µs, 按 actual_rate 算) */
+volatile uint32_t mp3_diag_row_meas_us = 0;   /* ★实测"一行"周期 = 相邻两次半传输回调的间隔 (µs)。
+                                               * 这是唯一不依赖任何假设的硬指标: 它就是硬件真正搬一行的耗时。
+                                               * 应有值(44.1k) = 2048 帧 / 44108Hz = 46.4ms。
+                                               * 若实测≈46ms 却整首歌耗时 43s ⇒ 时钟没问题, 是"内容被重复";
+                                               * 若实测≈66ms       ⇒ 就是 I2S 时钟慢了(那音高必然也低)。 */
+volatile uint32_t mp3_diag_prev_cyc    = 0;   /* 上一次半传输回调的 CYCCNT (0 = 还没开始) */
+volatile uint32_t mp3_diag_half_cnt    = 0;   /* DMA 半传输回调次数 (每 2 行一次) */
+volatile uint32_t mp3_diag_full_cnt    = 0;   /* ★DMA 全传输回调次数 (每 2 行一次, 与半回调交替)
+                                               * **必须两个都数**: "硬件播过的行数" = half + full。
+                                               * 只数半回调会漏掉一半, 比值就看不出来了(上一轮就栽在这)。 */
+volatile uint32_t mp3_diag_fill_cnt    = 0;   /* ★软件填充次数 = 真正产出的"新内容行"数。 */
+volatile uint32_t mp3_diag_row_tick_ms = 0;   /* ★用 FreeRTOS tick 实测的"一行"周期(ms)。 */
+volatile uint32_t mp3_diag_last_tick   = 0;
+volatile uint32_t mp3_diag_half_set_cyc = 0;  /* 半回调"置标志"的时刻(CYCCNT) */
+volatile uint32_t mp3_diag_full_set_cyc = 0;  /* 全回调"置标志"的时刻(CYCCNT) */
+volatile uint32_t mp3_diag_lat_max_us   = 0;  /* ★本秒内最差的"回调置标志 → 任务开始填充"延迟(µs)。
+                                               * 若这个延迟接近/超过一行周期(46.4ms), 说明任务响应太晚,
+                                               * 布尔标志会"合并"掉回调 —— 那是另一种丢行机制。 */
+volatile uint8_t  mp3_diag_active      = 0;   /* 1 = MP3 正在播放 */
+
+static void mp3_diag_dwt_init(void)
+{
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;   /* 使能跟踪单元 */
+	DWT->CYCCNT = 0;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              /* 使能周期计数器 */
+}
+
+/* 按固定列数补齐再显示, 免得新数字比旧数字短时留下残字 */
+static void oled_show_padded(uint8_t row, char *s, uint8_t cols)
+{
+	uint8_t n = (uint8_t)strlen(s);
+	while (n < cols) s[n++] = ' ';
+	s[n] = 0;
+	OLED_ShowString(row, 1, s);
+}
+
+/* 由滚动定时器任务每秒调用一次(限流: 否则 I2C 会拖垮实时性) */
+void mp3_diag_show(void)
+{
+	char buf[24];
+	uint32_t avg_ms  = mp3_diag_fill_cnt ? (mp3_diag_fill_us_sum / mp3_diag_fill_cnt / 1000u) : 0;
+	uint32_t pk_ms   = mp3_diag_fill_us_max / 1000u;  /* 本秒内最差的一次填充耗时 */
+	uint32_t rows    = mp3_diag_half_cnt + mp3_diag_full_cnt;   /* 硬件播过的"行"数 */
+
+	if (avg_ms  > 999u) avg_ms  = 999u;
+	if (pk_ms   > 999u) pk_ms   = 999u;
+
+	/* 第3行: H = 硬件播过的行数(半回调+全回调), F = 软件产出的"新内容"行数。
+	 * **H/F 就是"重复倍数"**; 按计数器方案 F 本应恒等于 H, 落后多少就说明欠了多少行。
+	 * (整个文件只有 1324800/2048 = 647 行内容 ⇒ F 到底必然 ≈647。) */
+	sprintf(buf, "H%lu F%lu", (unsigned long)rows, (unsigned long)mp3_diag_fill_cnt);
+	oled_show_padded(3, buf, 16);
+
+	/* 第4行: AVG = **平均**一次填充耗时(ms) —— 这个才是"跟不跟得上"的判据;
+	 *        PK  = 本秒内最差的一次填充(ms) —— 只看它会被"正好安静的那一秒"骗到。
+	 * 判读: AVG < 46.4ms(一行窗口) ⇒ 理论上跟得上, 欠账要往调度/逻辑上找;
+	 *       AVG > 46.4ms           ⇒ 填充本身不够快, 且 H/F 应约等于 AVG/46.4。 */
+	sprintf(buf, "AVG%lu PK%lu", (unsigned long)avg_ms, (unsigned long)pk_ms);
+	oled_show_padded(4, buf, 16);
+
+	mp3_diag_fill_us_max = mp3_diag_fill_us;   /* 开始统计下一秒的最差 */
+	mp3_diag_lat_max_us  = 0;
+}
+#endif /* MP3_FILL_DIAG */
+
+/* 包住一次 MP3 填充(统一入口, 关掉诊断就是零开销直通)。
+ * CYCCNT 是 32 位自由计数器, 168MHz 下 25.6s 回绕一次; 单次填充只有几十 ms,
+ * 用无符号相减天然正确处理回绕。 */
+static void mp3_fill_timed(uint16_t *buf)
+{
+#if MP3_FILL_DIAG
+	uint32_t t0 = DWT->CYCCNT;
+#endif
+	mp3_fill_buffer_region(buf, AUDIO_BUF_SIZE);
+#if MP3_FILL_DIAG
+	{
+		uint32_t us = (DWT->CYCCNT - t0) / (SystemCoreClock / 1000000u);
+		mp3_diag_fill_us = us;
+		if (us > mp3_diag_fill_us_max) mp3_diag_fill_us_max = us;
+		mp3_diag_fill_cnt++;      /* 统计"产出了多少行新内容"(整曲应 ≈ 647) */
+		mp3_diag_fill_us_sum += us;   /* 累计, 供显示"平均每次填充" */
+	}
+#endif
 }
 
 void mp3_file_process(file_list *ado_file)
@@ -1417,11 +1547,21 @@ void mp3_file_process(file_list *ado_file)
 		sr_len = (mp3_hz >= 10000) ? 5 : ((mp3_hz >= 1000) ? 4 : 3);
 		OLED_ShowNum(2, 8, mp3_hz, sr_len);
 		OLED_ShowString(2, 8+sr_len, "Hz");
+#if MP3_FILL_DIAG
+		/* 诊断模式: 第1行放标题(并把滚动关掉, 否则滚动刷新会把标题擦掉);
+		 * 第3/4行**先写上占位串**, 之后由定时器任务每秒刷真实数字 ——
+		 * 这样一眼就能确认"到底是没进 MP3 诊断界面, 还是只是数字没刷新"。 */
+		OLED_ShowString(1, 1, "MP3填充耗时诊断");
+		OLED_ShowString(3, 1, "H0 F0");
+		OLED_ShowString(4, 1, "LAT0 PK0");
+		scrollTextWidth = 0; scrollOffset = 0;
+#else
 		OLED_ShowString(3, 1, "声道:");
 		OLED_ShowNum(3, 5, mp3_channels, 1);
 		OLED_ShowString(4, 1, "位深:");
 		OLED_ShowString(4, 5, "16位");
 		{ static char song_utf8[256]; OLED_GBKString_To_UTF8(ado_file[current_index].audio_file_names, song_utf8); OLED_ShowScrollingString(song_utf8); }
+#endif
 	}
 
 	/* 播放初始化 */
@@ -1429,9 +1569,31 @@ void mp3_file_process(file_list *ado_file)
 	actual_rate = i2s_set_sample_rate(mp3_hz);
 	resample_step = (uint32_t)(((uint64_t)mp3_hz << RESAMPLE_FRAC_BITS) / actual_rate);
 	resample_pos = 0;
+#if MP3_FILL_DIAG
+	/* 一行缓冲的"应有"播放时长(µs): 用实际输出采样率算(不是 mp3_hz) */
+	mp3_diag_dwt_init();
+	mp3_diag_row_us       = (uint32_t)(((uint64_t)(AUDIO_BUF_SIZE / 4u) * 1000000u) / actual_rate);
+	mp3_diag_fill_us      = 0;
+	mp3_diag_fill_us_max  = 0;
+	mp3_diag_fill_us_sum  = 0;
+	mp3_diag_prev_cyc     = 0;   /* 基准清零(避免用开机以来的旧时间戳算出垃圾) */
+	mp3_diag_row_meas_us  = 0;
+	mp3_diag_last_tick    = 0;
+	mp3_diag_row_tick_ms  = 0;
+	mp3_diag_half_cnt     = 0;   /* H: 硬件播过的行数(半回调) */
+	mp3_diag_full_cnt     = 0;   /* H: 硬件播过的行数(全回调) */
+	mp3_diag_fill_cnt     = 0;   /* F: 软件产出的新内容行数 */
+	mp3_diag_half_set_cyc = DWT->CYCCNT;   /* 延迟基准: 先设成当前时刻, 免得第一次算出开机以来的垃圾值 */
+	mp3_diag_full_set_cyc = DWT->CYCCNT;
+	mp3_diag_lat_max_us   = 0;             /* 最差响应延迟 */
+#endif
+	/* 行计数器归零(DMA 从 row0 起播, 第一次回调是"半" = row0 播完) */
+	mp3_rows_done   = 0;
+	mp3_rows_filled = 0;
+	mp3_fill_row    = 0;
 	force_i2s_config();
-	mp3_fill_buffer_region(audio_buffer[0], AUDIO_BUF_SIZE);
-	mp3_fill_buffer_region(audio_buffer[1], AUDIO_BUF_SIZE);
+	mp3_fill_timed(audio_buffer[0]);
+	mp3_fill_timed(audio_buffer[1]);
 	if (file_ended) {
 		/* 预填解码失败(后续帧解不出) */
 		mp3_play_ok = 0;
@@ -1450,6 +1612,9 @@ void mp3_file_process(file_list *ado_file)
 	play_state = STATE_PLAYING;
 	HAL_I2S_Transmit_DMA(&hi2s2, &audio_buffer[0][0], AUDIO_BUF_SIZE);
 	WM8960_AfterClockStart();   /* ★时钟已稳(且在起 DMA 之后): 按手册反序恢复 codec(内部含延时) */
+#if MP3_FILL_DIAG
+	mp3_diag_active = 1;        /* 通知定时器任务: 开始每秒刷填充耗时 */
+#endif
 
 	/* 播放循环 */
 	while (!file_ended && play_state != STATE_STOPPED)
@@ -1471,13 +1636,48 @@ void mp3_file_process(file_list *ado_file)
 			if (g_sd_io_err) { g_sd_io_err = 0; audio_stop(); file_ended = 1; break; }
 			if (seek_speed < 0) seek_speed = 0;   /* MP3 不支持快退 */
 			seek_update_display(ado_file);
-			if (half_ready) { mp3_fill_buffer_region(audio_buffer[0], AUDIO_BUF_SIZE); half_ready = 0; }
-			if (full_ready) { mp3_fill_buffer_region(audio_buffer[1], AUDIO_BUF_SIZE); full_ready = 0; }
-			if (!half_ready && !full_ready) osDelay(1);
+			/* ★★★先清零、再填充 —— 这两行的顺序是本 bug 的正解, 千万不要改回去!
+			 * 原来是"先填充、后清零": 填充要 11~21ms, 清零在填充之后 ——
+			 *   于是**填充期间到达的那个回调所设置的标志, 会被随后的清零一起抹掉**,
+			 *   那一次重填就被丢掉 → 环形 DMA 没有新数据 → 只好把旧行再播一遍 → 时间被拉长。
+			 * 实测佐证: H(硬件播过的行数)/F(软件填过的行数) = 877/616 = **1.42**, 与音频量到的
+			 *   慢速倍数、以及"丢弃比例 261/877 = 29.8% ≈ 窗口占比 12~23%×2"三者互相吻合;
+			 *   而 PK(最差填充) 只有 21ms « 一行窗口 46.4ms ⇒ 不是"填充慢", 就是丢标志。
+			 * 改成"先清零": 填充期间到达的回调会把标志**重新置 1**, 下一轮再填一次 —— 不会丢。
+			 * (安全: 回调意味着"这一行刚播完", 立刻重填不会覆盖正在播的行; 填充 21ms 也远小于 2 行 92.8ms。) */
+			/* ★★★按"已播行数"把该重填的行补齐 —— 用计数器, 不用布尔标志。
+			 * ★每轮最多补 2 行, 且之后**无条件** osDelay(1):
+			 *   否则一旦填充跟不上(补不完), 这个 while 就永远出不去 ⇒ 整个音频任务卡死在填充里 ⇒
+			 *     ① 按键(上一首/下一首/停止)全都不响应;
+			 *     ② 低优先级的定时器任务被饿死 ⇒ **OLED 诊断一直停在占位串(全 0), 看不到任何数字**
+			 *        —— 而那恰恰是最需要看数字的时候(上一版就栽在这里)。
+			 *   无条件让出 1ms 的代价可以忽略(一次填充要 15~66ms), 换来的是整机不会"闷死"。 */
+			{
+				uint32_t budget = 2;   /* 每轮最多补 2 行 */
+				while (mp3_rows_filled != mp3_rows_done && budget != 0) {
+					uint8_t r = mp3_fill_row;
+#if MP3_FILL_DIAG
+					{	/* 量"最近一次回调 → 现在开始填充"的延迟(带上限, 免得时间戳没置过时算出垃圾) */
+						uint32_t setc = r ? mp3_diag_full_set_cyc : mp3_diag_half_set_cyc;
+						uint32_t lat  = (DWT->CYCCNT - setc) / (SystemCoreClock / 1000000u);
+						if (lat < 2000000u && lat > mp3_diag_lat_max_us) mp3_diag_lat_max_us = lat;
+					}
+#endif
+					mp3_fill_row ^= 1;          /* 与回调顺序一致: row0 → row1 → row0 … */
+					mp3_rows_filled++;
+					budget--;
+					mp3_fill_timed(audio_buffer[r]);
+					if (file_ended) break;      /* 解码到头: 交给外层收尾 */
+				}
+				osDelay(1);   /* ★无条件让出: 保证按键、定时器任务(诊断显示/USB 轮询)不被饿死 */
+			}
 		}
 	}
 
 	mp3_play_ok = 1;   /* 正常播放结束 */
+#if MP3_FILL_DIAG
+	mp3_diag_active = 0;        /* 播放结束, 停掉诊断刷新 */
+#endif
 	WM8960_BeforeClockStop();   /* ★手册 p69: 停 MCLK 前先软静音 + 关 DAC 并等 >=1ms(内部含延时) */
 	HAL_I2S_DMAStop(&hi2s2);
 	MP3FreeDecoder(mp3_hdec);
@@ -1660,12 +1860,39 @@ void audio_stop(void) {
 
 void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-	half_ready = 1;
+#if MP3_FILL_DIAG
+	/* 一次半传输 = 硬件播完一行(2048 帧)。
+	 * 这里同时用两个互相独立的时间基准量行周期, 并且统计"播了多少行"(H):
+	 *   DWT CYCCNT —— 依赖 SystemCoreClock 的换算;
+	 *   FreeRTOS tick —— 依赖 SysTick(= 系统节拍, 已由整机行为验证过是对的)。
+	 * 两者不一致 ⇒ 说明是时间基准的问题, 不是硬件真的变了。 */
+	if (mp3_diag_active) {
+		uint32_t nowc = DWT->CYCCNT;
+		uint32_t nowt = HAL_GetTick();
+		mp3_diag_half_cnt++;
+		if (mp3_diag_prev_cyc != 0)
+			mp3_diag_row_meas_us = (nowc - mp3_diag_prev_cyc) / (SystemCoreClock / 1000000u);
+		mp3_diag_prev_cyc = nowc;
+		if (mp3_diag_last_tick != 0)
+			mp3_diag_row_tick_ms = nowt - mp3_diag_last_tick;
+		mp3_diag_last_tick = nowt;
+		mp3_diag_half_set_cyc = nowc;   /* 记下"置标志"的时刻, 供任务端算响应延迟 */
+	}
+#endif
+	mp3_rows_done++;    /* ★播完一行(row0) —— 计数器方案的核心: 每个回调都算一行, 不会丢 */
+	half_ready = 1;     /* 保留给 WAV/FLAC 用的老标志 */
 }
 
 void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s)
 {
-	full_ready = 1;
+#if MP3_FILL_DIAG
+	if (mp3_diag_active) {
+		mp3_diag_full_cnt++;                   /* 全传输回调同样代表"一行播完了" */
+		mp3_diag_full_set_cyc = DWT->CYCCNT;   /* 记下"置标志"的时刻 */
+	}
+#endif
+	mp3_rows_done++;    /* ★播完一行(row1) */
+	full_ready = 1;     /* 保留给 WAV/FLAC 用的老标志 */
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
