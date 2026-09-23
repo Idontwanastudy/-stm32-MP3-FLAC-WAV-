@@ -18,14 +18,6 @@
 /* MP3 支持开关: 1=启用 (Helix 定点解码器) */
 #define ENABLE_MP3 1
 
-/* ★MP3 填充耗时诊断(临时脚手架): 1=开启。
- * 用 DWT CYCCNT 量"一行缓冲的填充耗时", 与"该行的播放时长"作比:
- *   比 < 1 → 填充跟得上;  比 > 1 → 填充跑不完播放窗口
- *   → 环形 I2S DMA 会绕回去重复旧数据 → 听感"变慢"而音高不变。
- * 开启后 MP3 播放界面显示: FILL(本次填充ms/该行播放ms)、R(比值)、PK(本秒最差比值)。
- * 定性完把这里改成 0 即可 —— 相关代码全部被这个宏包住, 不留残渣。 */
-#define MP3_FILL_DIAG 1
-
 #define max_size 100        /* 文件列表上限 (禁用FLAC后恢复为100) */
 #define max_length 120
 /* I2S DMA 缓冲：半字数组。
@@ -86,13 +78,6 @@ extern uint16_t current_index;
 extern volatile uint8_t half_ready;
 extern volatile uint8_t full_ready;
 
-/* MP3 填充耗时诊断(见上面 MP3_FILL_DIAG): 显示放在滚动定时器任务里做,
- * 音频任务只写这几个变量, 绝不在播放任务里做 I2C。 */
-#if MP3_FILL_DIAG && ENABLE_MP3
-extern volatile uint8_t mp3_diag_active;    /* 1=MP3 正在播放 */
-void mp3_diag_show(void);                   /* 由定时器任务每秒调用一次 */
-#endif
-
 //extern FATFS SDFatFS;    /* 文件系统对象 */
 //extern FIL SDFile;       /* 文件对象 */
 //extern DIR SDDir;        /* 目录对象 */
@@ -109,7 +94,6 @@ extern volatile uint8_t  key_prev_down;   /* PE0 上一首 按下状态 */
 extern volatile uint8_t  key_next_down;   /* PE1 下一首 按下状态 */
 extern volatile uint32_t key_prev_tick;   /* PE0 按下时刻 */
 extern volatile uint32_t key_next_tick;   /* PE1 按下时刻 */
-
 
 uint8_t check_extension(const char *name, const char *ext);
 uint8_t audio_file_load(void);

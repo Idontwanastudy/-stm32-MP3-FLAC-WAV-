@@ -444,18 +444,6 @@ void OLED_SCROLL_Callback(void *argument)
     }
   }
 
-#if MP3_FILL_DIAG && ENABLE_MP3
-  /* ===== MP3 填充耗时诊断: 每秒刷一次 (限流, 否则 I2C 会拖垮实时性) =====
-   * 显示放在这个低优先级定时器任务里做, 音频任务只写变量、绝不碰 I2C。 */
-  {
-    static uint8_t diag_div = 0;
-    if (mp3_diag_active) {
-      if (++diag_div >= 20) { diag_div = 0; mp3_diag_show(); }   /* 50ms × 20 = 1s */
-    } else {
-      diag_div = 0;
-    }
-  }
-#endif
 
   /* ===== 歌名滚动 (每 2 次推进一列 ~100ms) ===== */
   if (scrollTextWidth > 128)
